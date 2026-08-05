@@ -618,10 +618,10 @@
       /^\s*\d+(\.\d+)?\s*%\s*$/,                        // "34.4%"
       /^\s*Access will end on\b.*$/i,
       // Sidebar TOC entries: "24. Foo", "24.1. Bar", "24.1.1 Baz",
-      // optionally as a markdown heading (#) or bold. These are the
-      // duplicate table-of-contents lines that sit above the lesson.
-      /^\s*(?:#{1,6}\s+)?(?:\*\*)?\d+(?:\\?\.\d+)+\.?\s+\S.*$/,
-      /^\s*(?:#{1,6}\s+)?(?:\*\*)?\d+\\?\.\s+\S.*$/,
+      // optionally as bold. Plain text or **bold**, but NOT "# 24. ..."
+      // (which is the real body-start heading — we want to keep that).
+      /^\s*(?:\*\*)?\d+(?:\\?\.\d+)+\.?\s+\S.*$/,
+      /^\s*(?:\*\*)?\d+\\?\.\s+\S.*$/,
       // "PEN-200: 24. ..." breadcrumb
       /^\s*PEN-\d+\s*:\s*\d+\..*$/i,
     ];
@@ -633,8 +633,19 @@
       const esc = pageTitle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       titleLineRe = new RegExp(`^\\s*#{1,6}\\s+${esc}\\s*$`, "i");
     }
+    // Body-start detector: on OffSec lesson pages, the actual lesson body
+    // always begins with a top-level heading like "# 24. Foo" or
+    // "# 24.1.1. WMI and WinRM". If we can find that line, drop EVERYTHING
+    // above it (the meta panel, course description, sidebar TOC dupes).
+    const lines = md.split(/\r?\n/);
+    let bodyStart = -1;
+    const BODY_START_RE = /^\s*#\s+\d+(?:\\?\.\d+)*\\?\.\s+\S/;
+    for (let i = 0; i < lines.length; i++) {
+      if (BODY_START_RE.test(lines[i])) { bodyStart = i; break; }
+    }
+    const scan = bodyStart >= 0 ? lines.slice(bodyStart) : lines;
     const kept = [];
-    for (const line of md.split(/\r?\n/)) {
+    for (const line of scan) {
       if (NOISE_LINE.some((re) => re.test(line))) continue;
       if (titleLineRe && titleLineRe.test(line)) continue;
       kept.push(line);
