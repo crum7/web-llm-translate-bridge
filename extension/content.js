@@ -568,7 +568,8 @@
     // Defense in depth — even after stripNoise, kill anything unwanted turndown might see.
     td.remove(["script", "style", "nav", "button", "aside", "iframe", "header", "footer", "form", "svg"]);
 
-    const bodyMd = td.turndown(clone.innerHTML).trim();
+    let bodyMd = td.turndown(clone.innerHTML).trim();
+    bodyMd = truncateOffSecNoise(bodyMd, pageTitle);
 
     // 8. Build the header.
     const url = location.href;
@@ -587,6 +588,36 @@
     const markdown = header + bodyMd + "\n";
     console.log(`[llm-translate] markdown built: ${markdown.length} chars, ${imageOk} images inlined, title="${pageTitle}"`);
     return { ok: true, markdown, imageCount: imageOk };
+  }
+
+  // Post-conversion truncation for OffSec course pages: the "main content"
+  // still contains the "My Learning" breadcrumb + course logo + duplicate
+  // title + Overview/Syllabus tabs + full TOC. All of that follows the
+  // header separator as sibling nodes, so we chop from the first known
+  // noise marker onwards. If none match, return as-is.
+  function truncateOffSecNoise(md, pageTitle) {
+    if (!md) return md;
+    const NOISE_MARKERS = [
+      /^\s*!\[[^\]]*\]\(data:image\/[a-z]+;base64,/im, // any inline base64 image
+      /^\s*My Learning\s*$/im,
+      /^\s*Course\s*XP\s*OSCP\+?\s*$/im,
+      /^\s*(Overview|Syllabus|Challenge Labs|Exam)\s*$/im,
+    ];
+    // If the page title appears again as a heading in the body, that's the
+    // start of the duplicated TOC block — cut there.
+    if (pageTitle) {
+      const esc = pageTitle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      NOISE_MARKERS.push(new RegExp(`^\\s*#{1,3}\\s+${esc}\\s*$`, "im"));
+    }
+    let cutAt = md.length;
+    for (const re of NOISE_MARKERS) {
+      const m = md.match(re);
+      if (m && m.index != null && m.index < cutAt) cutAt = m.index;
+    }
+    if (cutAt < md.length) {
+      return md.slice(0, cutAt).trimEnd();
+    }
+    return md;
   }
 
   // Remove structural noise (nav, sidebar, TOC, header, footer, breadcrumbs, ...)
