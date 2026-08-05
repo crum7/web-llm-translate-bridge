@@ -6,3 +6,5 @@ dist/
 build/
 *.zip
 tmp/
+# TLS certs (Tailscale MagicDNS host cert — private key, never commit)
+bridge/certs/

@@ -4,7 +4,12 @@
   "version": "0.1.0",
   "description": "Translate the whole page in-place using a local Claude Code bridge.",
   "permissions": ["activeTab", "storage", "scripting"],
-  "host_permissions": ["<all_urls>", "http://127.0.0.1:17891/*"],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1:17891/*",
+    "https://home-tuyotuyo.tailf8de78.ts.net:17891/*",
+    "https://100.104.251.67:17891/*"
+  ],
   "action": {
     "default_popup": "popup.html",
     "default_title": "LLM Translate"

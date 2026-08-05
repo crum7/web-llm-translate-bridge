@@ -1,19 +1,34 @@
 // llm-translate-bridge / bridge
-// Local HTTP server that shells out to `claude -p` (Claude Code CLI) to translate text.
+// Local HTTPS server that shells out to `claude -p` (Claude Code CLI) to translate text.
 // Uses the user's Max subscription auth (~/.claude/credentials.json). No API key required.
+//
+// Two modes:
+//   MODE=local     — HTTP  on 127.0.0.1:PORT (single-machine use)
+//   MODE=tailscale — HTTPS on <tailscale-ip>:PORT with MagicDNS cert (default)
 
 import express from "express";
 import cors from "cors";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { writeFileSync, mkdirSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import http from "node:http";
+import https from "node:https";
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+const MODE = process.env.MODE || "tailscale";
 const PORT = Number(process.env.PORT || 17891);
-const HOST = "127.0.0.1";
 const MODEL = process.env.MODEL || "opus";
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
+const TAILSCALE_IP = process.env.TAILSCALE_IP || "100.104.251.67";
+const TAILSCALE_HOST = process.env.TAILSCALE_HOST || "home-tuyotuyo.tailf8de78.ts.net";
+const CERT_PATH = process.env.CERT_PATH || join(__dirname, "certs", "tailscale.crt");
+const KEY_PATH = process.env.KEY_PATH || join(__dirname, "certs", "tailscale.key");
+
+const HOST = MODE === "local" ? "127.0.0.1" : TAILSCALE_IP;
 
 // One-shot auth token: written to ~/.llm-translate-bridge/token so the extension
 // can read it (via a small helper) or the user can copy-paste it into settings.
@@ -27,10 +42,16 @@ app.use(express.json({ limit: "2mb" }));
 app.use(
   cors({
     origin: (origin, cb) => {
-      // Allow chrome-extension://* and no-origin (curl / same-origin health checks)
-      if (!origin || origin.startsWith("chrome-extension://")) return cb(null, true);
+      // Allow chrome-extension://* and no-origin (curl / same-origin health checks).
+      // Also allow https/http origins because when the extension fires from a content
+      // script the browser sends the page's origin, not chrome-extension://.
+      if (!origin) return cb(null, true);
+      if (origin.startsWith("chrome-extension://")) return cb(null, true);
+      if (origin.startsWith("http://") || origin.startsWith("https://")) return cb(null, true);
       return cb(new Error("origin not allowed"));
     },
+    // Preflight: allow our custom auth header.
+    allowedHeaders: ["Content-Type", "x-bridge-token"],
   }),
 );
 
@@ -43,16 +64,13 @@ app.use((req, res, next) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, model: MODEL, version: "0.1.0" });
+  res.json({ ok: true, model: MODEL, mode: MODE, version: "0.2.0" });
 });
 
 /**
  * POST /translate
  * body: { texts: string[], target: string (e.g. "ja"), source?: string }
  * returns: { translations: string[] }
- *
- * All texts are batched into ONE `claude -p` call for latency + token efficiency.
- * We ask Claude to return a JSON array of translations, one per input, in order.
  */
 app.post("/translate", async (req, res) => {
   const { texts, target = "ja", source = "auto" } = req.body || {};
@@ -76,7 +94,6 @@ app.post("/translate", async (req, res) => {
 });
 
 function buildPrompt(texts, source, target) {
-  // Number each snippet so Claude can align outputs unambiguously.
   const numbered = texts.map((t, i) => `[${i}] ${t}`).join("\n---\n");
   return [
     `You are a translation engine. Translate the following text snippets from ${source} to ${target}.`,
@@ -97,7 +114,7 @@ function buildPrompt(texts, source, target) {
 function runClaude(prompt) {
   return new Promise((resolve, reject) => {
     const args = ["-p", "--model", MODEL, "--output-format", "text"];
-    const child = spawn(CLAUDE_BIN, args, { stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(CLAUDE_BIN, args, { stdio: ["pipe", "pipe", "pipe"], shell: true });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => (stdout += d.toString()));
@@ -113,7 +130,6 @@ function runClaude(prompt) {
 
 function parseTranslations(raw, expectedLen) {
   const trimmed = raw.trim();
-  // Try direct JSON first, then extract the first [...] block if Claude added prose.
   let jsonText = trimmed;
   if (!trimmed.startsWith("[")) {
     const m = trimmed.match(/\[[\s\S]*\]/);
@@ -132,8 +148,43 @@ function parseTranslations(raw, expectedLen) {
   return arr.map((x) => String(x));
 }
 
-app.listen(PORT, HOST, () => {
-  console.log(`llm-translate-bridge listening on http://${HOST}:${PORT}`);
+// ------ start server ------
+
+function start() {
+  if (MODE === "local") {
+    http.createServer(app).listen(PORT, HOST, () => {
+      console.log(`llm-translate-bridge (local/HTTP) listening on http://${HOST}:${PORT}`);
+      printCommon();
+    });
+    return;
+  }
+
+  // tailscale mode: HTTPS with MagicDNS cert
+  if (!existsSync(CERT_PATH) || !existsSync(KEY_PATH)) {
+    console.error(`ERROR: cert files not found`);
+    console.error(`  cert: ${CERT_PATH}`);
+    console.error(`  key : ${KEY_PATH}`);
+    console.error(`Re-issue with: tailscale cert ${TAILSCALE_HOST}`);
+    process.exit(1);
+  }
+  const cert = readFileSync(CERT_PATH);
+  const key = readFileSync(KEY_PATH);
+  https.createServer({ cert, key }, app).listen(PORT, HOST, () => {
+    console.log(`llm-translate-bridge (tailscale/HTTPS) listening on https://${TAILSCALE_HOST}:${PORT}`);
+    console.log(`bind: ${HOST}:${PORT}`);
+    printCommon();
+  });
+}
+
+function printCommon() {
   console.log(`model: ${MODEL}`);
-  console.log(`token: ${TOKEN}  (also saved to ${join(stateDir, "token")})`);
-});
+  console.log(`token: ${TOKEN}`);
+  console.log(`  (also saved to ${join(stateDir, "token")})`);
+  if (MODE !== "local") {
+    console.log(``);
+    console.log(`Extension "Bridge URL" should be:`);
+    console.log(`  https://${TAILSCALE_HOST}:${PORT}`);
+  }
+}
+
+start();
