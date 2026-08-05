@@ -66,3 +66,24 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   chrome.storage.session.remove(`state:${tabId}`).catch(() => {});
 });
+
+// Image proxy: content scripts hit CORS on cross-origin images, but the
+// extension itself (via host_permissions <all_urls>) can fetch anything.
+// Handler returns a data: URL so content.js can inline the image into Markdown.
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.action !== "fetchImageAsDataUrl") return; // not for us
+  (async () => {
+    try {
+      const res = await fetch(msg.url, { credentials: "include" });
+      if (!res.ok) return sendResponse({ ok: false, error: `HTTP ${res.status}` });
+      const blob = await res.blob();
+      const reader = new FileReader();
+      reader.onloadend = () => sendResponse({ ok: true, dataUrl: reader.result });
+      reader.onerror = () => sendResponse({ ok: false, error: String(reader.error) });
+      reader.readAsDataURL(blob);
+    } catch (e) {
+      sendResponse({ ok: false, error: e.message });
+    }
+  })();
+  return true; // async response
+});

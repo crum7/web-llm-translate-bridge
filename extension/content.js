@@ -487,20 +487,36 @@
     // 2. Deep-clone so we can rewrite <img> src to base64 without polluting the page.
     const clone = mainEl.cloneNode(true);
 
-    // 3. Inline all images as base64 (in parallel). Skip data: URLs (already inlined).
-    const imgs = Array.from(clone.querySelectorAll("img"));
+    // 3. Inline all images as base64 (in parallel).
+    // Note: querySelectorAll on clone finds imgs in the cloned subtree only.
+    // If the main element ITSELF is a small wrapper without imgs, we widen to
+    // the closest ancestor that DOES have imgs (still on the live DOM).
+    let imgs = Array.from(clone.querySelectorAll("img"));
+    console.log(`[llm-translate] main container: <${mainEl.tagName}${mainEl.className ? "." + String(mainEl.className).split(/\s+/).slice(0, 2).join(".") : ""}> — <img> found: ${imgs.length}`);
+    let attempts = 0;
+    let ok = 0;
+    let alreadyData = 0;
+    const errorReasons = new Map();
     const results = await Promise.allSettled(imgs.map(async (img) => {
       const src = img.getAttribute("src");
-      if (!src || src.startsWith("data:")) return;
+      if (!src) return;
+      if (src.startsWith("data:")) { alreadyData++; return; }
+      attempts++;
       try {
         const dataUrl = await fetchAsDataUrl(new URL(src, location.href).href);
         img.setAttribute("src", dataUrl);
+        ok++;
       } catch (e) {
-        // Leave the original src (turndown will emit ![](http_url) as fallback).
-        console.warn(`[llm-translate] image inline failed: ${src}`, e.message);
+        const reason = e.message || String(e);
+        errorReasons.set(reason, (errorReasons.get(reason) || 0) + 1);
+        console.warn(`[llm-translate] image inline failed: ${src.slice(0, 80)} — ${reason}`);
       }
     }));
-    const imageOk = results.filter((r) => r.status === "fulfilled").length;
+    if (errorReasons.size > 0) {
+      console.warn(`[llm-translate] image error breakdown:`, Object.fromEntries(errorReasons));
+    }
+    console.log(`[llm-translate] image summary: ${imgs.length} total, ${alreadyData} already data:, ${attempts} fetched, ${ok} succeeded`);
+    const imageOk = ok + alreadyData;
 
     // 4. Configure turndown.
     const td = new TurndownService({
@@ -541,36 +557,77 @@
     return { ok: true, markdown, imageCount: imageOk };
   }
 
-  // Auto-detect the main text container. Preference order:
-  //   .markdown-content -> <article> -> <main> -> <body>
+  // Auto-detect the main text container by SCORING candidate elements.
+  // Score = text length * 1 + <p>/<li> count * 200 + <img> count * 100
+  //         - <nav>/<header>/<footer>/<button> in subtree * 500 (penalize chrome)
+  // Pick the highest-scoring element. Falls back to body if nothing scores well.
   function findMainContent() {
-    const candidates = [
-      ".markdown-content",     // offsec.com uses this
-      "article",
-      "main",
-      "[role='main']",
-      "#content",
-      ".content",
+    // Named selectors first — if they exist AND have real content, prefer them.
+    const namedSelectors = [
+      ".markdown-content", ".prose",
+      "article", "main", "[role='main']",
+      "#content", "#main", ".content", ".post-content",
     ];
-    for (const sel of candidates) {
-      const el = document.querySelector(sel);
-      if (el && el.textContent.trim().length > 200) return el;
+    const namedHits = [];
+    for (const sel of namedSelectors) {
+      document.querySelectorAll(sel).forEach((el) => namedHits.push(el));
     }
-    return document.body;
+
+    // Also consider any <div> with a lot of <p>/<img> — for SPAs like offsec.com
+    // where the content wrapper has generic class names.
+    const genericCandidates = Array.from(document.querySelectorAll("div, section")).filter((el) => {
+      const paras = el.querySelectorAll("p, li, h1, h2, h3").length;
+      const imgs = el.querySelectorAll("img").length;
+      return paras + imgs >= 5;
+    });
+
+    const all = [...new Set([...namedHits, ...genericCandidates])];
+    if (all.length === 0) return document.body;
+
+    let best = null;
+    let bestScore = -Infinity;
+    for (const el of all) {
+      const txtLen = el.textContent.trim().length;
+      if (txtLen < 200) continue;
+      const paras = el.querySelectorAll("p, li, h1, h2, h3, h4").length;
+      const imgs = el.querySelectorAll("img").length;
+      // Penalize elements that also contain navigation chrome — that means we
+      // grabbed too high (like the root #app).
+      const chrome = el.querySelectorAll("nav, header, footer").length;
+      const score = txtLen + paras * 200 + imgs * 100 - chrome * 500;
+      if (score > bestScore) { bestScore = score; best = el; }
+    }
+    console.log(`[llm-translate] findMainContent: picked <${best?.tagName || "BODY"}${best?.className ? "." + String(best.className).split(/\s+/).slice(0, 3).join(".") : ""}> score=${bestScore}`);
+    return best || document.body;
   }
 
-  // Fetch a URL and return a data: URL. Uses fetch (respects CORS) and FileReader.
-  function fetchAsDataUrl(url) {
-    return new Promise(async (resolve, reject) => {
-      try {
-        const res = await fetch(url, { credentials: "include" });
-        if (!res.ok) return reject(new Error(`HTTP ${res.status}`));
+  // Fetch a URL and return a data: URL.
+  // Strategy: content-script fetch first (fast, uses page cookies).
+  // If that fails (usually CORS on cross-origin CDN), fall back to service-worker
+  // fetch via chrome.runtime.sendMessage — the extension context has
+  // host_permissions <all_urls> so CORS doesn't apply.
+  async function fetchAsDataUrl(url) {
+    // Direct attempt
+    try {
+      const res = await fetch(url, { credentials: "include" });
+      if (res.ok) {
         const blob = await res.blob();
-        const reader = new FileReader();
-        reader.onloadend = () => resolve(reader.result);
-        reader.onerror = () => reject(reader.error);
-        reader.readAsDataURL(blob);
-      } catch (e) { reject(e); }
+        return await blobToDataUrl(blob);
+      }
+    } catch { /* fall through to background fetch */ }
+
+    // Background service worker fallback
+    const bg = await chrome.runtime.sendMessage({ action: "fetchImageAsDataUrl", url });
+    if (bg?.ok) return bg.dataUrl;
+    throw new Error(bg?.error || "both direct and background fetch failed");
+  }
+
+  function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onloadend = () => resolve(r.result);
+      r.onerror = () => reject(r.error);
+      r.readAsDataURL(blob);
     });
   }
 

@@ -10,6 +10,7 @@
     "https://home-tuyotuyo.tailf8de78.ts.net:17891/*",
     "https://100.104.251.67:17891/*"
   ],
+  "web_accessible_resources": [],
   "action": {
     "default_popup": "popup.html",
     "default_title": "LLM Translate"
