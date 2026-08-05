@@ -508,21 +508,25 @@
     // 1. Locate the main content region.
     const mainEl = findMainContent();
     if (!mainEl) return { ok: false, error: "本文エリアが見つからない" };
+    console.log(`[llm-translate] main container: <${mainEl.tagName}${mainEl.className ? "." + String(mainEl.className).split(/\s+/).slice(0, 2).join(".") : ""}>`);
 
-    // 2. Deep-clone so we can rewrite <img> src to base64 without polluting the page.
+    // 2. Deep-clone so we can mutate freely.
     const clone = mainEl.cloneNode(true);
 
-    // 3. Inline all images as base64 (in parallel).
-    // Note: querySelectorAll on clone finds imgs in the cloned subtree only.
-    // If the main element ITSELF is a small wrapper without imgs, we widen to
-    // the closest ancestor that DOES have imgs (still on the live DOM).
-    let imgs = Array.from(clone.querySelectorAll("img"));
-    console.log(`[llm-translate] main container: <${mainEl.tagName}${mainEl.className ? "." + String(mainEl.className).split(/\s+/).slice(0, 2).join(".") : ""}> — <img> found: ${imgs.length}`);
+    // 3. Strip navigation / sidebar / TOC / brand chrome from the clone.
+    stripNoise(clone);
+
+    // 4. Extract a real page title (lesson h1) before we start inlining.
+    const pageTitle = extractPageTitle(mainEl, clone);
+
+    // 5. Inline images as base64, but skip logo/brand/icon noise.
+    let imgs = Array.from(clone.querySelectorAll("img")).filter((img) => !isNoiseImage(img));
+    console.log(`[llm-translate] content images (after logo/icon filter): ${imgs.length}`);
     let attempts = 0;
     let ok = 0;
     let alreadyData = 0;
     const errorReasons = new Map();
-    const results = await Promise.allSettled(imgs.map(async (img) => {
+    await Promise.allSettled(imgs.map(async (img) => {
       const src = img.getAttribute("src");
       if (!src) return;
       if (src.startsWith("data:")) { alreadyData++; return; }
@@ -540,35 +544,38 @@
     if (errorReasons.size > 0) {
       console.warn(`[llm-translate] image error breakdown:`, Object.fromEntries(errorReasons));
     }
-    console.log(`[llm-translate] image summary: ${imgs.length} total, ${alreadyData} already data:, ${attempts} fetched, ${ok} succeeded`);
+    console.log(`[llm-translate] image summary: ${imgs.length} candidate, ${alreadyData} already data:, ${attempts} fetched, ${ok} succeeded`);
     const imageOk = ok + alreadyData;
 
-    // 4. Configure turndown.
+    // 6. Nuke any remaining noise images from the clone so turndown never sees them.
+    for (const img of Array.from(clone.querySelectorAll("img"))) {
+      if (isNoiseImage(img)) img.remove();
+    }
+
+    // 7. Configure turndown.
     const td = new TurndownService({
-      headingStyle: "atx",           // # H1 / ## H2
-      codeBlockStyle: "fenced",      // ```
+      headingStyle: "atx",
+      codeBlockStyle: "fenced",
       bulletListMarker: "-",
       emDelimiter: "*",
       strongDelimiter: "**",
       linkStyle: "inlined",
     });
-    // Preserve GFM tables (turndown drops <table> by default).
     td.addRule("table", {
       filter: "table",
       replacement: (_content, node) => htmlTableToMarkdown(node),
     });
-    // Strip <button> / <nav> / <script> / <style> that snuck in.
-    td.remove(["script", "style", "nav", "button", "aside", "iframe"]);
+    // Defense in depth — even after stripNoise, kill anything unwanted turndown might see.
+    td.remove(["script", "style", "nav", "button", "aside", "iframe", "header", "footer", "form", "svg"]);
 
     const bodyMd = td.turndown(clone.innerHTML).trim();
 
-    // 5. Build the header.
-    const title = (document.title || "").trim() || "(タイトルなし)";
+    // 8. Build the header.
     const url = location.href;
     const now = new Date();
     const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
     const header = [
-      `# ${title}`,
+      `# ${pageTitle}`,
       ``,
       `> 出典: ${url}`,
       `> 取得日: ${dateStr}`,
@@ -578,8 +585,66 @@
     ].join("\n");
 
     const markdown = header + bodyMd + "\n";
-    console.log(`[llm-translate] markdown built: ${markdown.length} chars, ${imageOk}/${imgs.length} images inlined`);
+    console.log(`[llm-translate] markdown built: ${markdown.length} chars, ${imageOk} images inlined, title="${pageTitle}"`);
     return { ok: true, markdown, imageCount: imageOk };
+  }
+
+  // Remove structural noise (nav, sidebar, TOC, header, footer, breadcrumbs, ...)
+  // from a cloned subtree before turndown runs.
+  function stripNoise(root) {
+    const KILL_SELECTORS = [
+      "nav", "aside", "header", "footer", "svg",
+      "[role='navigation']", "[role='banner']", "[role='contentinfo']",
+      "[class*='sidebar' i]",
+      "[class*='navigation' i]",
+      "[class*='breadcrumb' i]",
+      "[class*='toc' i]",
+      "[class*='table-of-contents' i]",
+      "[class*='menu' i]",
+      "[class*='header' i]",
+      "[class*='footer' i]",
+      "[class*='drawer' i]",
+      "[class*='chrome' i]",
+      "[aria-label*='navigation' i]",
+      "[aria-label*='menu' i]",
+      "[data-testid*='sidebar' i]",
+      "[data-testid*='nav' i]",
+    ];
+    let removed = 0;
+    for (const sel of KILL_SELECTORS) {
+      let list;
+      try { list = root.querySelectorAll(sel); } catch { continue; }
+      list.forEach((el) => {
+        if (el !== root) { el.remove(); removed++; }
+      });
+    }
+    if (removed) console.log(`[llm-translate] stripped ${removed} noise elements from clone`);
+  }
+
+  // Detect logos / brand marks / tiny icons that aren't lesson content.
+  function isNoiseImage(img) {
+    const src = (img.getAttribute("src") || "").toLowerCase();
+    const alt = (img.getAttribute("alt") || "").toLowerCase();
+    const cls = (img.className && typeof img.className === "string" ? img.className : "").toLowerCase();
+    if (/logo|brand|avatar|icon|favicon/.test(src)) return true;
+    if (/logo|brand|avatar|icon/.test(alt)) return true;
+    if (/logo|brand|avatar|icon/.test(cls)) return true;
+    const w = img.naturalWidth || img.width || 0;
+    const h = img.naturalHeight || img.height || 0;
+    if (w > 0 && h > 0 && w < 32 && h < 32) return true;
+    return false;
+  }
+
+  // Prefer the lesson's own <h1>/<h2> over the site chrome <title>.
+  function extractPageTitle(originalMain, clone) {
+    for (const sel of ["h1", "h2", "h3"]) {
+      const h = clone.querySelector(sel) || originalMain.querySelector(sel);
+      if (h) {
+        const t = h.textContent.replace(/\s+/g, " ").trim();
+        if (t.length > 0 && t.length < 200) return t;
+      }
+    }
+    return (document.title || "").trim() || "(タイトルなし)";
   }
 
   // Auto-detect the main text container by SCORING candidate elements.
