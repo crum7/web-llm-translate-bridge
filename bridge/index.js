@@ -30,15 +30,47 @@ const KEY_PATH = process.env.KEY_PATH || join(__dirname, "certs", "tailscale.key
 
 const HOST = MODE === "local" ? "127.0.0.1" : TAILSCALE_IP;
 
-// One-shot auth token: written to ~/.llm-translate-bridge/token so the extension
-// can read it (via a small helper) or the user can copy-paste it into settings.
-const TOKEN = randomBytes(16).toString("hex");
+// Auth token resolution order:
+//   1. env BRIDGE_TOKEN (explicit override, wins over everything)
+//   2. ~/.llm-translate-bridge/token from a previous run (persistent)
+//   3. freshly generated 16-byte hex (first-run only), then persisted
+// This way, restarting the bridge does NOT force re-pasting the token into the extension.
 const stateDir = join(homedir(), ".llm-translate-bridge");
 mkdirSync(stateDir, { recursive: true });
-writeFileSync(join(stateDir, "token"), TOKEN, { mode: 0o600 });
+const tokenPath = join(stateDir, "token");
+
+let TOKEN;
+let tokenSource;
+if (process.env.BRIDGE_TOKEN) {
+  TOKEN = process.env.BRIDGE_TOKEN.trim();
+  tokenSource = "env BRIDGE_TOKEN";
+} else if (existsSync(tokenPath)) {
+  const saved = readFileSync(tokenPath, "utf8").trim();
+  if (saved && /^[a-f0-9]{16,}$/i.test(saved)) {
+    TOKEN = saved;
+    tokenSource = `reused from ${tokenPath}`;
+  }
+}
+if (!TOKEN) {
+  TOKEN = randomBytes(16).toString("hex");
+  tokenSource = "newly generated";
+}
+writeFileSync(tokenPath, TOKEN, { mode: 0o600 });
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
+
+// Access log — every request, including OPTIONS preflights, gets logged with timing.
+app.use((req, res, next) => {
+  const start = Date.now();
+  const origin = req.get("origin") || "-";
+  const ua = (req.get("user-agent") || "-").slice(0, 40);
+  console.log(`[req ] ${req.method} ${req.path}  origin=${origin}  ua=${ua}`);
+  res.on("finish", () => {
+    console.log(`[resp] ${req.method} ${req.path}  ${res.statusCode}  ${Date.now() - start}ms`);
+  });
+  next();
+});
 app.use(
   cors({
     origin: (origin, cb) => {
@@ -81,11 +113,15 @@ app.post("/translate", async (req, res) => {
     return res.status(400).json({ error: "texts must be strings" });
   }
 
+  console.log(`[tr  ] ${texts.length} snippet(s), target=${target}, first="${texts[0].slice(0, 60)}..."`);
   const prompt = buildPrompt(texts, source, target);
+  const t0 = Date.now();
 
   try {
     const raw = await runClaude(prompt);
+    console.log(`[tr  ] claude returned ${raw.length} chars in ${Date.now() - t0}ms`);
     const translations = parseTranslations(raw, texts.length);
+    console.log(`[tr  ] parsed ${translations.length} translations, first="${translations[0]?.slice(0, 60)}..."`);
     res.json({ translations });
   } catch (err) {
     console.error("[translate] error:", err);
@@ -178,8 +214,8 @@ function start() {
 
 function printCommon() {
   console.log(`model: ${MODEL}`);
-  console.log(`token: ${TOKEN}`);
-  console.log(`  (also saved to ${join(stateDir, "token")})`);
+  console.log(`token: ${TOKEN}  (${tokenSource})`);
+  console.log(`  saved to ${tokenPath}`);
   if (MODE !== "local") {
     console.log(``);
     console.log(`Extension "Bridge URL" should be:`);

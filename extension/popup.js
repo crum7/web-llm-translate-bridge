@@ -32,10 +32,18 @@ async function send(action, payload) {
   });
 }
 
+// Listen for progress pings from content.js
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg?.progress) {
+    const { current, total } = msg.progress;
+    $("status").textContent = `翻訳中… ${current}/${total} バッチ`;
+  }
+});
+
 $("go").addEventListener("click", async () => {
   const target = $("target").value;
   await chrome.storage.sync.set({ target });
-  $("status").textContent = "翻訳中…";
+  $("status").textContent = "翻訳中… 準備";
   try {
     const res = await send("translate", { target });
     $("status").textContent = res?.ok

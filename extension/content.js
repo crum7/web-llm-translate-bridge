@@ -76,16 +76,24 @@
     const BATCH = 40;
     const batches = chunk(nodes, BATCH);
     let done = 0;
+    let bi = 0;
 
+    console.log(`[llm-translate] ${nodes.length} nodes → ${batches.length} batch(es)`);
     for (const batch of batches) {
+      bi++;
       const texts = batch.map((n) => n.nodeValue);
+      const t0 = performance.now();
+      console.log(`[llm-translate] batch ${bi}/${batches.length} (${texts.length} snippets) → POST ${bridgeUrl}/translate`);
+      // notify popup of progress via runtime message (fire-and-forget)
+      try { chrome.runtime.sendMessage({ progress: { current: bi, total: batches.length } }); } catch {}
       let translations;
       try {
         translations = await translateBatch(texts, { bridgeUrl, token, target });
       } catch (e) {
-        console.error("[llm-translate] batch failed:", e);
+        console.error(`[llm-translate] batch ${bi} failed:`, e);
         continue;
       }
+      console.log(`[llm-translate] batch ${bi} ok in ${Math.round(performance.now() - t0)}ms`);
       batch.forEach((node, i) => {
         const t = translations[i];
         if (typeof t !== "string") return;
@@ -95,6 +103,7 @@
       });
       done += batch.length;
     }
+    console.log(`[llm-translate] done: ${done}/${nodes.length}`);
     return { ok: true, count: done };
   }
 
