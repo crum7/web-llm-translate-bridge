@@ -609,6 +609,21 @@
       /^\s*OSCP\+?\s*$/i,
       /^\s*(Overview|Syllabus|Challenge Labs|Exam)\s*$/i,
       /^\s*!\[[^\]]*\]\(data:image\/[a-z]+;base64,/i, // inline base64 image
+      // OffSec course meta-panel above the lesson body
+      /^\s*レベル\s*$/i,
+      /^\s*Text\s+Video\s*$/i,
+      /^\s*Lab\s*$/i,
+      /^\s*\d+\s*h\s*$/i,                              // "321h"
+      /^\s*Progress:?\s*$/i,
+      /^\s*\d+(\.\d+)?\s*%\s*$/,                        // "34.4%"
+      /^\s*Access will end on\b.*$/i,
+      // Sidebar TOC entries: "24. Foo", "24.1. Bar", "24.1.1 Baz",
+      // optionally as a markdown heading (#) or bold. These are the
+      // duplicate table-of-contents lines that sit above the lesson.
+      /^\s*(?:#{1,6}\s+)?(?:\*\*)?\d+(?:\\?\.\d+)+\.?\s+\S.*$/,
+      /^\s*(?:#{1,6}\s+)?(?:\*\*)?\d+\\?\.\s+\S.*$/,
+      // "PEN-200: 24. ..." breadcrumb
+      /^\s*PEN-\d+\s*:\s*\d+\..*$/i,
     ];
     // Duplicate page-title heading (e.g. "# Kali Linux..." appearing again
     // right below our own header). Drop the exact line only, not everything
