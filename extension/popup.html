@@ -23,9 +23,16 @@
     </select>
     <label for="model" style="margin-top:8px;">モデル</label>
     <select id="model">
-      <option value="haiku">Haiku (速い / 安い)</option>
-      <option value="sonnet" selected>Sonnet 4.5 (推奨)</option>
-      <option value="opus">Opus (最高品質 / 遅い)</option>
+      <optgroup label="Claude (Max)">
+        <option value="haiku">Haiku (速い / 安い)</option>
+        <option value="sonnet" selected>Sonnet 4.5 (推奨)</option>
+        <option value="opus">Opus (最高品質 / 遅い)</option>
+      </optgroup>
+      <optgroup label="Codex (ChatGPT)">
+        <option value="codex-gpt-5-mini">GPT-5 mini (速い)</option>
+        <option value="codex-gpt-5">GPT-5</option>
+        <option value="codex-gpt-5-codex">GPT-5 Codex</option>
+      </optgroup>
     </select>
     <button id="go">このページを翻訳</button>
     <button id="restore" style="background:#666;">原文に戻す</button>

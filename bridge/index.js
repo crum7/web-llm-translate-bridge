@@ -10,7 +10,7 @@ import express from "express";
 import cors from "cors";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, existsSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,6 +23,7 @@ const MODE = process.env.MODE || "tailscale";
 const PORT = Number(process.env.PORT || 17891);
 const MODEL = process.env.MODEL || "sonnet";
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
+const CODEX_BIN = process.env.CODEX_BIN || "codex";
 const TAILSCALE_IP = process.env.TAILSCALE_IP || "100.104.251.67";
 const TAILSCALE_HOST = process.env.TAILSCALE_HOST || "home-tuyotuyo.tailf8de78.ts.net";
 const CERT_PATH = process.env.CERT_PATH || join(__dirname, "certs", "tailscale.crt");
@@ -96,7 +97,14 @@ app.use((req, res, next) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, model: MODEL, mode: MODE, version: "0.2.0" });
+  res.json({
+    ok: true,
+    model: MODEL,
+    mode: MODE,
+    version: "0.3.0",
+    providers: ["claude", "codex"],
+    models: Object.keys(MODEL_REGISTRY),
+  });
 });
 
 /**
@@ -104,9 +112,24 @@ app.get("/health", (_req, res) => {
  * body: { texts: string[], target: string (e.g. "ja"), source?: string }
  * returns: { translations: string[] }
  */
-// Whitelist of model aliases the extension is allowed to request.
-// Anything else falls back to the default env MODEL.
-const ALLOWED_MODELS = new Set(["haiku", "sonnet", "opus"]);
+// Model registry — maps the alias the extension sends to (provider, actualModel).
+// Anything else falls back to the default env MODEL (Claude sonnet).
+const MODEL_REGISTRY = {
+  // Claude Code (uses ~/.claude auth, Max subscription)
+  haiku:    { provider: "claude", model: "haiku"  },
+  sonnet:   { provider: "claude", model: "sonnet" },
+  opus:     { provider: "claude", model: "opus"   },
+  // Codex CLI (uses ~/.codex auth, ChatGPT Plus/Pro subscription)
+  "codex-gpt-5":      { provider: "codex", model: "gpt-5"      },
+  "codex-gpt-5-mini": { provider: "codex", model: "gpt-5-mini" },
+  "codex-gpt-5-codex": { provider: "codex", model: "gpt-5-codex" },
+};
+
+function resolveModel(reqModel) {
+  if (reqModel && MODEL_REGISTRY[reqModel]) return { alias: reqModel, ...MODEL_REGISTRY[reqModel] };
+  const fallback = MODEL_REGISTRY[MODEL] || MODEL_REGISTRY.sonnet;
+  return { alias: MODEL, ...fallback };
+}
 
 app.post("/translate", async (req, res) => {
   const { texts, target = "ja", source = "auto", model: reqModel } = req.body || {};
@@ -117,11 +140,11 @@ app.post("/translate", async (req, res) => {
     return res.status(400).json({ error: "texts must be strings" });
   }
 
-  const model = reqModel && ALLOWED_MODELS.has(reqModel) ? reqModel : MODEL;
-  console.log(`[tr  ] ${texts.length} snippet(s), target=${target}, model=${model}, first="${texts[0].slice(0, 60)}..."`);
+  const resolved = resolveModel(reqModel);
+  console.log(`[tr  ] ${texts.length} snippet(s), target=${target}, model=${resolved.alias} (${resolved.provider}:${resolved.model}), first="${texts[0].slice(0, 60)}..."`);
 
   try {
-    const translations = await translateWithBisection(texts, source, target, 0, model);
+    const translations = await translateWithBisection(texts, source, target, 0, resolved);
     console.log(`[tr  ] final ${translations.length} translations, first="${translations[0]?.slice(0, 60)}..."`);
     res.json({ translations });
   } catch (err) {
@@ -135,18 +158,18 @@ app.post("/translate", async (req, res) => {
  * bisect the batch and translate halves independently, recursively down to size 1.
  * Guarantees every input gets translated OR at worst falls back to the original.
  */
-async function translateWithBisection(texts, source, target, depth = 0, model = MODEL) {
+async function translateWithBisection(texts, source, target, depth = 0, resolved = resolveModel()) {
   const prompt = buildPrompt(texts, source, target);
   const t0 = Date.now();
   let raw;
   try {
-    raw = await runClaude(prompt, model);
+    raw = await runLLM(prompt, resolved);
   } catch (e) {
-    if (texts.length > 1) return bisect(texts, source, target, depth, model);
+    if (texts.length > 1) return bisect(texts, source, target, depth, resolved);
     console.warn(`[tr  ] single-item translate failed at depth ${depth}, using original: ${e.message}`);
     return [texts[0]];
   }
-  console.log(`[tr  ] [d${depth}] claude(${model}) returned ${raw.length} chars in ${Date.now() - t0}ms for ${texts.length} items`);
+  console.log(`[tr  ] [d${depth}] ${resolved.provider}(${resolved.model}) returned ${raw.length} chars in ${Date.now() - t0}ms for ${texts.length} items`);
 
   try {
     return parseTranslations(raw, texts.length);
@@ -157,29 +180,29 @@ async function translateWithBisection(texts, source, target, depth = 0, model = 
       const missingIdx = [];
       for (let i = 0; i < texts.length; i++) if (parsed[i] === null) missingIdx.push(i);
       const gapTexts = missingIdx.map((i) => texts[i]);
-      const gapResults = await bisect(gapTexts, source, target, depth + 1, model);
+      const gapResults = await bisect(gapTexts, source, target, depth + 1, resolved);
       const out = parsed.slice();
       missingIdx.forEach((i, j) => (out[i] = gapResults[j] ?? texts[i]));
       return out.map((v, i) => (v == null ? texts[i] : String(v)));
     }
     if (e.parseFailed && texts.length > 1) {
       console.warn(`[tr  ] [d${depth}] no blocks parsed, bisecting`);
-      return bisect(texts, source, target, depth, model);
+      return bisect(texts, source, target, depth, resolved);
     }
     console.warn(`[tr  ] [d${depth}] giving up on item, using original: ${e.message}`);
     return texts.slice();
   }
 }
 
-async function bisect(texts, source, target, depth, model = MODEL) {
+async function bisect(texts, source, target, depth, resolved) {
   if (texts.length === 0) return [];
   if (texts.length === 1) return [texts[0]];
   const mid = Math.floor(texts.length / 2);
   const left = texts.slice(0, mid);
   const right = texts.slice(mid);
   const [lRes, rRes] = await Promise.all([
-    translateWithBisection(left, source, target, depth + 1, model),
-    translateWithBisection(right, source, target, depth + 1, model),
+    translateWithBisection(left, source, target, depth + 1, resolved),
+    translateWithBisection(right, source, target, depth + 1, resolved),
   ]);
   return [...lRes, ...rRes];
 }
@@ -226,6 +249,11 @@ function buildPrompt(texts, source, target) {
   ].join("\n");
 }
 
+function runLLM(prompt, resolved) {
+  if (resolved.provider === "codex") return runCodex(prompt, resolved.model);
+  return runClaude(prompt, resolved.model);
+}
+
 function runClaude(prompt, model = MODEL) {
   return new Promise((resolve, reject) => {
     const args = ["-p", "--model", model, "--output-format", "text"];
@@ -238,6 +266,50 @@ function runClaude(prompt, model = MODEL) {
     child.on("close", (code) => {
       if (code !== 0) return reject(new Error(`claude exited ${code}: ${stderr}`));
       resolve(stdout);
+    });
+    child.stdin.end(prompt);
+  });
+}
+
+// codex exec: non-interactive Codex CLI. Uses ChatGPT-plan auth via ~/.codex.
+// We write the final assistant message to a tmp file (--output-last-message)
+// so we don't have to parse stdout event stream / ANSI noise.
+function runCodex(prompt, model = "gpt-5") {
+  return new Promise((resolve, reject) => {
+    const outFile = join(
+      stateDir,
+      `codex-out-${Date.now()}-${randomBytes(4).toString("hex")}.txt`,
+    );
+    const args = [
+      "exec",
+      "--model", model,
+      "--skip-git-repo-check",
+      "--ephemeral",
+      "--color", "never",
+      "--sandbox", "read-only",
+      "--output-last-message", outFile,
+      "-", // read prompt from stdin
+    ];
+    const child = spawn(CODEX_BIN, args, { stdio: ["pipe", "pipe", "pipe"], shell: true });
+    let stderr = "";
+    // Drain stdout so the pipe doesn't fill up, but we don't parse it —
+    // the last-message file is our source of truth.
+    child.stdout.on("data", () => {});
+    child.stderr.on("data", (d) => (stderr += d.toString()));
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) {
+        try { if (existsSync(outFile)) unlinkSync(outFile); } catch {}
+        return reject(new Error(`codex exited ${code}: ${stderr.slice(-500)}`));
+      }
+      try {
+        const out = existsSync(outFile) ? readFileSync(outFile, "utf8") : "";
+        try { unlinkSync(outFile); } catch {}
+        if (!out.trim()) return reject(new Error("codex produced empty output"));
+        resolve(out);
+      } catch (e) {
+        reject(e);
+      }
     });
     child.stdin.end(prompt);
   });
