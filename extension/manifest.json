@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "LLM Translate (Claude Bridge)",
+  "version": "0.1.0",
+  "description": "Translate the whole page in-place using a local Claude Code bridge.",
+  "permissions": ["activeTab", "storage", "scripting"],
+  "host_permissions": ["<all_urls>", "http://127.0.0.1:17891/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "LLM Translate"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "options_page": "options.html"
+}
