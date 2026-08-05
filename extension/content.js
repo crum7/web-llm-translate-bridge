@@ -44,45 +44,51 @@
   const PLACEHOLDER_RE = /⟦(\d+)⟧/g;
 
   /**
-   * Find translatable block elements: those that contain visible text and are not
-   * ancestors of other block elements we already picked (avoid double-translating).
+   * Find translatable block elements. A block is captured if:
+   *   - it's in BLOCK_TAGS, AND
+   *   - it contains meaningful text, AND
+   *   - it does NOT contain any nested block-tag descendant with text
+   *     (nested-block case: we descend and capture the inner block instead)
+   *
+   * Non-block elements (e.g. <div>, <section>) are transparent — we recurse into
+   * their children individually. This is the key fix vs v0.8: a <div> mixing a
+   * <p> sibling with a <ul> sibling used to lose the <p> because the presence
+   * of <ul> made us skip the whole <div>'s children iteration.
    */
   function findBlocks(root) {
     const blocks = [];
-    const seen = new WeakSet();
+
+    function hasNestedBlockWithText(el) {
+      for (const c of el.children) {
+        if (SKIP_TAGS.has(c.tagName)) continue;
+        if (BLOCK_TAGS.has(c.tagName) && c.textContent.trim().length >= 2) return true;
+        if (hasNestedBlockWithText(c)) return true;
+      }
+      return false;
+    }
 
     function visit(el) {
-      if (!el || seen.has(el)) return;
+      if (!el) return;
       const tag = el.tagName;
       if (!tag || SKIP_TAGS.has(tag)) return;
       if (el.isContentEditable) return;
 
-      // Does this element contain child block elements? If so, recurse into them
-      // instead of treating this as one block.
-      const childBlocks = Array.from(el.children).filter((c) => BLOCK_TAGS.has(c.tagName) || containsBlock(c));
-      if (childBlocks.length > 0) {
-        for (const c of el.children) visit(c);
-        return;
-      }
-
-      // Otherwise, if THIS is a block and has meaningful text, capture it.
       if (BLOCK_TAGS.has(tag)) {
-        const txt = el.textContent.trim();
-        if (txt.length >= 2 && /\p{L}/u.test(txt)) {
-          blocks.push(el);
-          seen.add(el);
+        // This IS a block. If it has nested blocks (e.g. <li> containing <p>),
+        // prefer the inner blocks; otherwise capture this one.
+        if (hasNestedBlockWithText(el)) {
+          for (const c of el.children) visit(c);
+          return;
         }
-        return;
+        const txt = el.textContent.trim();
+        if (txt.length >= 2 && /\p{L}/u.test(txt)) blocks.push(el);
+        return; // don't descend past a captured block
       }
 
-      // Not a block itself — recurse.
+      // Non-block container (<div>, <section>, <article>, <main>, ...):
+      // ALWAYS descend into every child independently. This is what was broken
+      // in v0.8 — sibling <p> got dropped when a <ul> sibling existed.
       for (const c of el.children) visit(c);
-    }
-
-    function containsBlock(el) {
-      if (BLOCK_TAGS.has(el.tagName)) return true;
-      for (const c of el.children) if (containsBlock(c)) return true;
-      return false;
     }
 
     visit(root);
