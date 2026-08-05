@@ -14,17 +14,25 @@
 (() => {
   if (window.__llmTranslateBridge) return;
   window.__llmTranslateBridge = {
-    blocks: [],           // [{ el, originalHTML }]
-    cache: new Map(),     // text-with-placeholders -> translated-with-placeholders
+    blocks: [],              // [{ el, originalHTML }]
+    cache: new Map(),        // text-with-placeholders -> translated-with-placeholders
+    lastSettings: null,      // remembered {bridgeUrl, token, target} for auto re-translate
+    observer: null,          // MutationObserver
+    reTranslateTimer: null,  // debounce timer
+    inFlightRetranslate: false,
   };
   const state = window.__llmTranslateBridge;
 
   // Elements whose text should be translated as one unit.
+  // NOTE: <A>, <BUTTON>, <LABEL> are NOT here — they're inline. Putting <A> here
+  // was the root cause of v0.8-v0.12 losing <p>s that contained an inline <a>:
+  // hasNestedBlockWithText saw the <a>, thought the <p> had a nested block, and
+  // descended past the <p> — capturing only the link text and dropping the rest.
   const BLOCK_TAGS = new Set([
     "P","LI","DT","DD","BLOCKQUOTE",
     "H1","H2","H3","H4","H5","H6",
     "TD","TH","CAPTION","FIGCAPTION",
-    "SUMMARY","LEGEND","LABEL","BUTTON","A",
+    "SUMMARY","LEGEND",
   ]);
 
   // Elements to skip entirely (never traverse into).
@@ -37,7 +45,7 @@
   const INLINE_TAGS = new Set([
     "A","STRONG","B","EM","I","U","S","MARK","SMALL","SUB","SUP",
     "CODE","KBD","SAMP","SPAN","ABBR","CITE","Q","TIME","VAR",
-    "BR","IMG","BUTTON","LABEL",
+    "BR","IMG","BUTTON","LABEL","BDI","BDO","WBR","DFN","DEL","INS",
   ]);
 
   const PLACEHOLDER = (n) => `⟦${n}⟧`;
@@ -197,9 +205,19 @@
 
   async function doTranslate({ bridgeUrl, token, target }) {
     if (!token) throw new Error("token未設定。拡張のオプションで設定してください");
+    // Remember settings so MutationObserver can auto re-translate on SPA nav.
+    state.lastSettings = { bridgeUrl, token, target };
 
     // 1. Discover blocks. Save originalHTML for restore().
-    const blocks = findBlocks(document.body);
+    // Exclude blocks we've already translated (state.blocks tracks by element).
+    const alreadySeen = new WeakSet(state.blocks.map((b) => b.el));
+    const found = findBlocks(document.body);
+    const blocks = found.filter((el) => !alreadySeen.has(el));
+    if (blocks.length === 0 && state.blocks.length > 0) {
+      // Nothing new to translate.
+      startObserver();
+      return { ok: true, count: 0 };
+    }
     if (blocks.length === 0) return { ok: true, count: 0 };
     for (const el of blocks) state.blocks.push({ el, originalHTML: el.innerHTML });
 
@@ -271,7 +289,52 @@
 
     console.log(`[llm-translate] applied ${applied}/${blocks.length} blocks`);
     safeSend({ done: { count: applied } });
+
+    // Kick off the observer so newly-added blocks (SPA route change, lazy load,
+    // Vue re-render) get translated too.
+    startObserver();
     return { ok: true, count: applied };
+  }
+
+  /**
+   * Watch the DOM for new translatable blocks and translate them automatically.
+   * Debounced 800ms so bursts of mutations coalesce into one re-run.
+   */
+  function startObserver() {
+    if (state.observer) return; // already watching
+    state.observer = new MutationObserver(() => scheduleReTranslate());
+    state.observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: false,
+    });
+    console.log("[llm-translate] MutationObserver armed");
+  }
+
+  function scheduleReTranslate() {
+    if (!state.lastSettings) return;
+    clearTimeout(state.reTranslateTimer);
+    state.reTranslateTimer = setTimeout(runReTranslate, 800);
+  }
+
+  async function runReTranslate() {
+    if (state.inFlightRetranslate) return; // don't overlap
+    if (!state.lastSettings) return;
+    state.inFlightRetranslate = true;
+    try {
+      const found = findBlocks(document.body);
+      const alreadySeen = new WeakSet(state.blocks.map((b) => b.el));
+      const fresh = found.filter((el) => !alreadySeen.has(el));
+      if (fresh.length === 0) return;
+      console.log(`[llm-translate] observer: ${fresh.length} new block(s) → re-translate`);
+      // Re-enter doTranslate. It picks up only the new blocks via the same
+      // alreadySeen filter, so no work is repeated.
+      await doTranslate(state.lastSettings);
+    } catch (e) {
+      console.error("[llm-translate] observer re-translate failed:", e);
+    } finally {
+      state.inFlightRetranslate = false;
+    }
   }
 
   function doRestore() {
