@@ -132,18 +132,22 @@ app.post("/translate", async (req, res) => {
 function buildPrompt(texts, source, target) {
   const numbered = texts.map((t, i) => `[${i}] ${t}`).join("\n---\n");
   return [
-    `You are a translation engine. Translate the following text snippets from ${source} to ${target}.`,
-    `Rules:`,
-    `- Preserve original meaning, tone, and formatting (inline HTML/markdown/whitespace).`,
-    `- Do NOT add commentary, notes, or explanations.`,
-    `- If a snippet is already in ${target}, return it unchanged.`,
-    `- Output MUST be a single JSON array of strings, one translation per input, in the same order.`,
-    `- Do not wrap the JSON in markdown code fences.`,
+    `You are a translation API. You MUST return ONLY a JSON array of strings, nothing else.`,
     ``,
-    `Input snippets (each prefixed with [index]):`,
+    `Task: translate ${texts.length} numbered snippets from ${source} to ${target}.`,
+    ``,
+    `Rules:`,
+    `- Preserve original meaning, tone, and inline formatting (HTML tags, markdown, punctuation, whitespace).`,
+    `- If a snippet is already in ${target}, copy it into the output unchanged (still as a JSON string in the array).`,
+    `- NEVER add commentary, notes, explanations, or [index] prefixes to the output.`,
+    `- NEVER wrap the output in markdown code fences or prose.`,
+    `- The response MUST start with '[' and end with ']'.`,
+    `- The array MUST have EXACTLY ${texts.length} string elements, in the same order as the input.`,
+    ``,
+    `Input:`,
     numbered,
     ``,
-    `Output: JSON array of ${texts.length} strings.`,
+    `Now output the JSON array of ${texts.length} translations:`,
   ].join("\n");
 }
 
@@ -166,22 +170,56 @@ function runClaude(prompt) {
 
 function parseTranslations(raw, expectedLen) {
   const trimmed = raw.trim();
-  let jsonText = trimmed;
-  if (!trimmed.startsWith("[")) {
+
+  // 1) Try direct JSON parse
+  let arr = tryJson(trimmed);
+
+  // 2) Try to extract the first well-formed [...] block (Claude sometimes prepends prose)
+  if (!arr) {
     const m = trimmed.match(/\[[\s\S]*\]/);
-    if (m) jsonText = m[0];
+    if (m) arr = tryJson(m[0]);
   }
-  let arr;
-  try {
-    arr = JSON.parse(jsonText);
-  } catch (e) {
-    throw new Error(`failed to parse JSON from claude output: ${e.message}\nraw: ${raw.slice(0, 500)}`);
+
+  // 3) Fallback: parse the "[N] translation\n---\n[N+1] ..." plain-text format
+  //    (Claude occasionally echoes the input format instead of returning JSON.)
+  if (!arr) {
+    arr = parseIndexedFallback(trimmed, expectedLen);
+    if (arr) console.warn(`[translate] used indexed-fallback parser (JSON parse failed)`);
   }
-  if (!Array.isArray(arr)) throw new Error("claude did not return an array");
+
+  if (!arr) {
+    throw new Error(`failed to parse translations from claude output.\nraw: ${raw.slice(0, 500)}`);
+  }
   if (arr.length !== expectedLen) {
     console.warn(`[translate] length mismatch: got ${arr.length}, expected ${expectedLen}`);
   }
   return arr.map((x) => String(x));
+}
+
+function tryJson(s) {
+  try {
+    const v = JSON.parse(s);
+    return Array.isArray(v) ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+// Parse the "[0] foo\n---\n[1] bar\n---\n[2] baz" style Claude sometimes emits.
+function parseIndexedFallback(raw, expectedLen) {
+  const parts = raw.split(/\n?---\n?/);
+  const out = new Array(expectedLen).fill("");
+  let matched = 0;
+  for (const part of parts) {
+    const m = part.match(/^\s*\[(\d+)\]\s*([\s\S]*?)\s*$/);
+    if (!m) continue;
+    const idx = Number(m[1]);
+    if (idx >= 0 && idx < expectedLen) {
+      out[idx] = m[2];
+      matched++;
+    }
+  }
+  return matched > 0 ? out : null;
 }
 
 // ------ start server ------

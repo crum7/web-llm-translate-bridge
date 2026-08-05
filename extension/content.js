@@ -50,22 +50,43 @@
     return out;
   }
 
-  async function translateBatch(texts, { bridgeUrl, token, target }) {
-    const res = await fetch(`${bridgeUrl}/translate`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-bridge-token": token,
-      },
-      body: JSON.stringify({ texts, target }),
-    });
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      throw new Error(`bridge ${res.status}: ${body.slice(0, 200)}`);
+  async function translateBatch(texts, { bridgeUrl, token, target }, attempt = 1) {
+    const MAX_ATTEMPTS = 3;
+    try {
+      const res = await fetch(`${bridgeUrl}/translate`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-bridge-token": token,
+        },
+        body: JSON.stringify({ texts, target }),
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        // 5xx = server-side (Claude flaked), worth retrying. 4xx = our bug, don't retry.
+        const retriable = res.status >= 500 && res.status < 600;
+        if (retriable && attempt < MAX_ATTEMPTS) {
+          console.warn(`[llm-translate] retry ${attempt}/${MAX_ATTEMPTS} after ${res.status}`);
+          await sleep(1000 * attempt);
+          return translateBatch(texts, { bridgeUrl, token, target }, attempt + 1);
+        }
+        throw new Error(`bridge ${res.status}: ${body.slice(0, 200)}`);
+      }
+      const data = await res.json();
+      return data.translations;
+    } catch (e) {
+      // Network-level failures (TypeError: Failed to fetch, ERR_CONNECTION_*) — retry
+      const netFail = e instanceof TypeError || /fetch|network|ECONN/i.test(e.message);
+      if (netFail && attempt < MAX_ATTEMPTS) {
+        console.warn(`[llm-translate] network retry ${attempt}/${MAX_ATTEMPTS}: ${e.message}`);
+        await sleep(1500 * attempt);
+        return translateBatch(texts, { bridgeUrl, token, target }, attempt + 1);
+      }
+      throw e;
     }
-    const data = await res.json();
-    return data.translations;
   }
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   async function doTranslate({ bridgeUrl, token, target }) {
     if (!token) throw new Error("token未設定。拡張のオプションで設定してください");
