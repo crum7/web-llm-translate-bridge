@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "LLM Translate (Claude Bridge)",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Translate the whole page in-place using a local Claude Code bridge.",
   "permissions": ["activeTab", "storage", "scripting", "tabs"],
   "host_permissions": [

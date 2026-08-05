@@ -10,7 +10,7 @@ import express from "express";
 import cors from "cors";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { writeFileSync, mkdirSync, readFileSync, existsSync, unlinkSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,7 +23,6 @@ const MODE = process.env.MODE || "tailscale";
 const PORT = Number(process.env.PORT || 17891);
 const MODEL = process.env.MODEL || "sonnet";
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
-const CODEX_BIN = process.env.CODEX_BIN || "codex";
 const TAILSCALE_IP = process.env.TAILSCALE_IP || "100.104.251.67";
 const TAILSCALE_HOST = process.env.TAILSCALE_HOST || "home-tuyotuyo.tailf8de78.ts.net";
 const CERT_PATH = process.env.CERT_PATH || join(__dirname, "certs", "tailscale.crt");
@@ -101,8 +100,8 @@ app.get("/health", (_req, res) => {
     ok: true,
     model: MODEL,
     mode: MODE,
-    version: "0.3.0",
-    providers: ["claude", "codex"],
+    version: "0.3.1",
+    providers: ["claude"],
     models: Object.keys(MODEL_REGISTRY),
   });
 });
@@ -114,15 +113,14 @@ app.get("/health", (_req, res) => {
  */
 // Model registry — maps the alias the extension sends to (provider, actualModel).
 // Anything else falls back to the default env MODEL (Claude sonnet).
+// (Codex provider was tried and abandoned — see git log v0.3.0 → v0.3.1.
+// ChatGPT-account Codex refuses gpt-5, and even valid models take minutes
+// per exec call because Codex spins up a full agent loop for each request.)
 const MODEL_REGISTRY = {
   // Claude Code (uses ~/.claude auth, Max subscription)
   haiku:    { provider: "claude", model: "haiku"  },
   sonnet:   { provider: "claude", model: "sonnet" },
   opus:     { provider: "claude", model: "opus"   },
-  // Codex CLI (uses ~/.codex auth, ChatGPT Plus/Pro subscription)
-  "codex-gpt-5":      { provider: "codex", model: "gpt-5"      },
-  "codex-gpt-5-mini": { provider: "codex", model: "gpt-5-mini" },
-  "codex-gpt-5-codex": { provider: "codex", model: "gpt-5-codex" },
 };
 
 function resolveModel(reqModel) {
@@ -250,7 +248,6 @@ function buildPrompt(texts, source, target) {
 }
 
 function runLLM(prompt, resolved) {
-  if (resolved.provider === "codex") return runCodex(prompt, resolved.model);
   return runClaude(prompt, resolved.model);
 }
 
@@ -271,49 +268,6 @@ function runClaude(prompt, model = MODEL) {
   });
 }
 
-// codex exec: non-interactive Codex CLI. Uses ChatGPT-plan auth via ~/.codex.
-// We write the final assistant message to a tmp file (--output-last-message)
-// so we don't have to parse stdout event stream / ANSI noise.
-function runCodex(prompt, model = "gpt-5") {
-  return new Promise((resolve, reject) => {
-    const outFile = join(
-      stateDir,
-      `codex-out-${Date.now()}-${randomBytes(4).toString("hex")}.txt`,
-    );
-    const args = [
-      "exec",
-      "--model", model,
-      "--skip-git-repo-check",
-      "--ephemeral",
-      "--color", "never",
-      "--sandbox", "read-only",
-      "--output-last-message", outFile,
-      "-", // read prompt from stdin
-    ];
-    const child = spawn(CODEX_BIN, args, { stdio: ["pipe", "pipe", "pipe"], shell: true });
-    let stderr = "";
-    // Drain stdout so the pipe doesn't fill up, but we don't parse it —
-    // the last-message file is our source of truth.
-    child.stdout.on("data", () => {});
-    child.stderr.on("data", (d) => (stderr += d.toString()));
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code !== 0) {
-        try { if (existsSync(outFile)) unlinkSync(outFile); } catch {}
-        return reject(new Error(`codex exited ${code}: ${stderr.slice(-500)}`));
-      }
-      try {
-        const out = existsSync(outFile) ? readFileSync(outFile, "utf8") : "";
-        try { unlinkSync(outFile); } catch {}
-        if (!out.trim()) return reject(new Error("codex produced empty output"));
-        resolve(out);
-      } catch (e) {
-        reject(e);
-      }
-    });
-    child.stdin.end(prompt);
-  });
-}
 
 function parseTranslations(raw, expectedLen) {
   // Primary path: delimiter-based parsing. Find each "<<<LLMT-N>>> ... <<<LLMT-END>>>" block.
