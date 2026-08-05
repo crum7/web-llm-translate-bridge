@@ -93,10 +93,12 @@
     const nodes = collectTextNodes(document.body);
     if (nodes.length === 0) return { ok: true, count: 0 };
 
-    // Smaller batches = LLM keeps JSON discipline better. 20 works well for Sonnet.
-    // CONCURRENCY = how many batches run in parallel against the bridge.
-    // Sonnet 4.5 with Max subscription can handle 10 concurrent easily.
-    const BATCH = 20;
+    // BATCH  = snippets per one claude call. Bigger = fewer CLI process spawns
+    //          (which is the actual bottleneck on Windows), better token amortization.
+    //          Sonnet 4.5 stays disciplined with the delimiter protocol up to ~80 snippets.
+    // CONCURRENCY = parallel in-flight batches. 10 is the sweet spot for a Max sub:
+    //               higher risks 429/529 (rate-limit / overloaded) and burns the 5h window.
+    const BATCH = 50;
     const CONCURRENCY = 10;
     const batches = chunk(nodes, BATCH);
     let done = 0;
