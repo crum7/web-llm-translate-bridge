@@ -104,8 +104,12 @@ app.get("/health", (_req, res) => {
  * body: { texts: string[], target: string (e.g. "ja"), source?: string }
  * returns: { translations: string[] }
  */
+// Whitelist of model aliases the extension is allowed to request.
+// Anything else falls back to the default env MODEL.
+const ALLOWED_MODELS = new Set(["haiku", "sonnet", "opus"]);
+
 app.post("/translate", async (req, res) => {
-  const { texts, target = "ja", source = "auto" } = req.body || {};
+  const { texts, target = "ja", source = "auto", model: reqModel } = req.body || {};
   if (!Array.isArray(texts) || texts.length === 0) {
     return res.status(400).json({ error: "texts must be a non-empty array" });
   }
@@ -113,10 +117,11 @@ app.post("/translate", async (req, res) => {
     return res.status(400).json({ error: "texts must be strings" });
   }
 
-  console.log(`[tr  ] ${texts.length} snippet(s), target=${target}, first="${texts[0].slice(0, 60)}..."`);
+  const model = reqModel && ALLOWED_MODELS.has(reqModel) ? reqModel : MODEL;
+  console.log(`[tr  ] ${texts.length} snippet(s), target=${target}, model=${model}, first="${texts[0].slice(0, 60)}..."`);
 
   try {
-    const translations = await translateWithBisection(texts, source, target);
+    const translations = await translateWithBisection(texts, source, target, 0, model);
     console.log(`[tr  ] final ${translations.length} translations, first="${translations[0]?.slice(0, 60)}..."`);
     res.json({ translations });
   } catch (err) {
@@ -130,58 +135,51 @@ app.post("/translate", async (req, res) => {
  * bisect the batch and translate halves independently, recursively down to size 1.
  * Guarantees every input gets translated OR at worst falls back to the original.
  */
-async function translateWithBisection(texts, source, target, depth = 0) {
+async function translateWithBisection(texts, source, target, depth = 0, model = MODEL) {
   const prompt = buildPrompt(texts, source, target);
   const t0 = Date.now();
   let raw;
   try {
-    raw = await runClaude(prompt);
+    raw = await runClaude(prompt, model);
   } catch (e) {
-    // Claude CLI itself blew up (rate limit, timeout, ...). Bisect if we can.
-    if (texts.length > 1) return bisect(texts, source, target, depth);
+    if (texts.length > 1) return bisect(texts, source, target, depth, model);
     console.warn(`[tr  ] single-item translate failed at depth ${depth}, using original: ${e.message}`);
     return [texts[0]];
   }
-  console.log(`[tr  ] [d${depth}] claude returned ${raw.length} chars in ${Date.now() - t0}ms for ${texts.length} items`);
+  console.log(`[tr  ] [d${depth}] claude(${model}) returned ${raw.length} chars in ${Date.now() - t0}ms for ${texts.length} items`);
 
   try {
     return parseTranslations(raw, texts.length);
   } catch (e) {
     if (e.partialParse && texts.length > 1) {
-      // We got SOME results. Reuse them where present, only retry the missing indexes.
       console.warn(`[tr  ] [d${depth}] partial: filling gaps via bisection`);
       const parsed = e.parsed;
       const missingIdx = [];
       for (let i = 0; i < texts.length; i++) if (parsed[i] === null) missingIdx.push(i);
       const gapTexts = missingIdx.map((i) => texts[i]);
-      const gapResults = await bisect(gapTexts, source, target, depth + 1);
+      const gapResults = await bisect(gapTexts, source, target, depth + 1, model);
       const out = parsed.slice();
       missingIdx.forEach((i, j) => (out[i] = gapResults[j] ?? texts[i]));
       return out.map((v, i) => (v == null ? texts[i] : String(v)));
     }
     if (e.parseFailed && texts.length > 1) {
       console.warn(`[tr  ] [d${depth}] no blocks parsed, bisecting`);
-      return bisect(texts, source, target, depth);
+      return bisect(texts, source, target, depth, model);
     }
-    // Single item that couldn't be parsed → fall back to original text.
     console.warn(`[tr  ] [d${depth}] giving up on item, using original: ${e.message}`);
     return texts.slice();
   }
 }
 
-async function bisect(texts, source, target, depth) {
+async function bisect(texts, source, target, depth, model = MODEL) {
   if (texts.length === 0) return [];
-  if (texts.length === 1) {
-    // One item that failed — return original so the page at least shows something.
-    return [texts[0]];
-  }
+  if (texts.length === 1) return [texts[0]];
   const mid = Math.floor(texts.length / 2);
   const left = texts.slice(0, mid);
   const right = texts.slice(mid);
-  // Parallel halves for speed.
   const [lRes, rRes] = await Promise.all([
-    translateWithBisection(left, source, target, depth + 1),
-    translateWithBisection(right, source, target, depth + 1),
+    translateWithBisection(left, source, target, depth + 1, model),
+    translateWithBisection(right, source, target, depth + 1, model),
   ]);
   return [...lRes, ...rRes];
 }
@@ -228,9 +226,9 @@ function buildPrompt(texts, source, target) {
   ].join("\n");
 }
 
-function runClaude(prompt) {
+function runClaude(prompt, model = MODEL) {
   return new Promise((resolve, reject) => {
-    const args = ["-p", "--model", MODEL, "--output-format", "text"];
+    const args = ["-p", "--model", model, "--output-format", "text"];
     const child = spawn(CLAUDE_BIN, args, { stdio: ["pipe", "pipe", "pipe"], shell: true });
     let stdout = "";
     let stderr = "";

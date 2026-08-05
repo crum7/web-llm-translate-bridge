@@ -13,15 +13,113 @@
 
 (() => {
   if (window.__llmTranslateBridge) return;
+
+  // Persistent cache config
+  const CACHE_KEY = "__llmTranslateBridge_cache_v1";
+  const CACHE_MAX_ENTRIES = 20000;     // ~ a few MB at 100 chars avg
+  const CACHE_TTL_MS = 30 * 24 * 3600 * 1000; // 30 days
+  const CACHE_FLUSH_DEBOUNCE_MS = 1500;
+
+  // Cache is stored per-target-language so "same text, different target" doesn't collide.
+  // localStorage layout: { "en->ja": { "source text ⟦0⟧": {t:"訳文 ⟦0⟧", ts:169..} , ... } }
+  function loadCacheFromStorage() {
+    try {
+      const raw = localStorage.getItem(CACHE_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return typeof parsed === "object" && parsed ? parsed : {};
+    } catch { return {}; }
+  }
+  const persistedBuckets = loadCacheFromStorage();
+
   window.__llmTranslateBridge = {
     blocks: [],              // [{ el, originalHTML }]
-    cache: new Map(),        // text-with-placeholders -> translated-with-placeholders
+    cache: new Map(),        // text-with-placeholders -> translated-with-placeholders (in-memory, hot)
+    persistedBuckets,        // { "en->ja": { text: {t, ts}, ... } }
+    persistBucketKey: null,  // set when first target lang known
+    persistDirty: false,
+    persistTimer: null,
     lastSettings: null,      // remembered {bridgeUrl, token, target} for auto re-translate
     observer: null,          // MutationObserver
     reTranslateTimer: null,  // debounce timer
     inFlightRetranslate: false,
   };
   const state = window.__llmTranslateBridge;
+
+  function bucketKeyFor(target, source = "auto") {
+    return `${source}->${target}`;
+  }
+
+  function seedCacheFromPersisted(target, source = "auto") {
+    const key = bucketKeyFor(target, source);
+    state.persistBucketKey = key;
+    const bucket = state.persistedBuckets[key] || {};
+    const now = Date.now();
+    let loaded = 0;
+    let expired = 0;
+    for (const [src, rec] of Object.entries(bucket)) {
+      if (!rec || typeof rec.t !== "string") continue;
+      if (rec.ts && now - rec.ts > CACHE_TTL_MS) {
+        delete bucket[src];
+        expired++;
+        continue;
+      }
+      state.cache.set(src, rec.t);
+      loaded++;
+    }
+    if (expired > 0) schedulePersistFlush();
+    console.log(`[llm-translate] cache loaded: ${loaded} entries from ${key} (expired: ${expired})`);
+    return loaded;
+  }
+
+  function persistPut(src, translated) {
+    if (!state.persistBucketKey) return;
+    const bucket = (state.persistedBuckets[state.persistBucketKey] ||= {});
+    bucket[src] = { t: translated, ts: Date.now() };
+    state.persistDirty = true;
+    schedulePersistFlush();
+  }
+
+  function schedulePersistFlush() {
+    if (state.persistTimer) return;
+    state.persistTimer = setTimeout(flushPersist, CACHE_FLUSH_DEBOUNCE_MS);
+  }
+
+  function flushPersist() {
+    state.persistTimer = null;
+    if (!state.persistDirty) return;
+    // Enforce global entry cap across all buckets — evict oldest by ts.
+    try {
+      let totalEntries = 0;
+      for (const b of Object.values(state.persistedBuckets)) totalEntries += Object.keys(b).length;
+      if (totalEntries > CACHE_MAX_ENTRIES) {
+        // Flatten, sort by ts asc, drop the oldest excess.
+        const flat = [];
+        for (const [bk, b] of Object.entries(state.persistedBuckets)) {
+          for (const [src, rec] of Object.entries(b)) flat.push({ bk, src, ts: rec.ts || 0 });
+        }
+        flat.sort((a, b) => a.ts - b.ts);
+        const toDrop = flat.slice(0, totalEntries - CACHE_MAX_ENTRIES);
+        for (const d of toDrop) delete state.persistedBuckets[d.bk][d.src];
+      }
+      localStorage.setItem(CACHE_KEY, JSON.stringify(state.persistedBuckets));
+      state.persistDirty = false;
+    } catch (e) {
+      // QuotaExceeded — drop half the entries and retry once.
+      console.warn("[llm-translate] persist failed, pruning:", e.message);
+      try {
+        for (const [bk, b] of Object.entries(state.persistedBuckets)) {
+          const entries = Object.entries(b).sort((a, b) => (a[1].ts || 0) - (b[1].ts || 0));
+          const keep = entries.slice(Math.floor(entries.length / 2));
+          state.persistedBuckets[bk] = Object.fromEntries(keep);
+        }
+        localStorage.setItem(CACHE_KEY, JSON.stringify(state.persistedBuckets));
+        state.persistDirty = false;
+      } catch (e2) {
+        console.error("[llm-translate] persist really failed:", e2.message);
+      }
+    }
+  }
 
   // Elements whose text should be translated as one unit.
   // NOTE: <A>, <BUTTON>, <LABEL> are NOT here — they're inline. Putting <A> here
@@ -171,13 +269,13 @@
     return out;
   }
 
-  async function translateBatch(texts, { bridgeUrl, token, target }, attempt = 1) {
+  async function translateBatch(texts, { bridgeUrl, token, target, model }, attempt = 1) {
     const MAX_ATTEMPTS = 3;
     try {
       const res = await fetch(`${bridgeUrl}/translate`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-bridge-token": token },
-        body: JSON.stringify({ texts, target }),
+        body: JSON.stringify({ texts, target, model }),
       });
       if (!res.ok) {
         const body = await res.text().catch(() => "");
@@ -185,7 +283,7 @@
         if (retriable && attempt < MAX_ATTEMPTS) {
           console.warn(`[llm-translate] retry ${attempt}/${MAX_ATTEMPTS} after ${res.status}`);
           await sleep(1000 * attempt);
-          return translateBatch(texts, { bridgeUrl, token, target }, attempt + 1);
+          return translateBatch(texts, { bridgeUrl, token, target, model }, attempt + 1);
         }
         throw new Error(`bridge ${res.status}: ${body.slice(0, 200)}`);
       }
@@ -196,17 +294,20 @@
       if (netFail && attempt < MAX_ATTEMPTS) {
         console.warn(`[llm-translate] network retry ${attempt}/${MAX_ATTEMPTS}: ${e.message}`);
         await sleep(1500 * attempt);
-        return translateBatch(texts, { bridgeUrl, token, target }, attempt + 1);
+        return translateBatch(texts, { bridgeUrl, token, target, model }, attempt + 1);
       }
       throw e;
     }
   }
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  async function doTranslate({ bridgeUrl, token, target }) {
+  async function doTranslate({ bridgeUrl, token, target, model }) {
     if (!token) throw new Error("token未設定。拡張のオプションで設定してください");
     // Remember settings so MutationObserver can auto re-translate on SPA nav.
-    state.lastSettings = { bridgeUrl, token, target };
+    state.lastSettings = { bridgeUrl, token, target, model };
+
+    // Seed the hot cache from localStorage for this target language (once).
+    if (state.persistBucketKey !== bucketKeyFor(target)) seedCacheFromPersisted(target);
 
     // 1. Discover blocks. Save originalHTML for restore().
     // Exclude blocks we've already translated (state.blocks tracks by element).
@@ -259,17 +360,20 @@
         console.log(`[llm-translate] [w${wid}] batch ${idx}/${batches.length} (${batch.length})`);
         let translations;
         try {
-          translations = await translateBatch(batch, { bridgeUrl, token, target });
+          translations = await translateBatch(batch, { bridgeUrl, token, target, model });
         } catch (e) {
           console.error(`[llm-translate] [w${wid}] batch ${idx} failed:`, e);
           completed++;
           safeSend({ progress: { current: completed, total: batches.length } });
           continue;
         }
-        // Fill cache with results
+        // Fill cache with results (in-memory + persist to localStorage debounced).
         batch.forEach((src, i) => {
           const tr = translations[i];
-          if (typeof tr === "string") state.cache.set(src, tr);
+          if (typeof tr === "string") {
+            state.cache.set(src, tr);
+            persistPut(src, tr);
+          }
         });
         completed++;
         console.log(`[llm-translate] [w${wid}] batch ${idx} ok in ${Math.round(performance.now() - t0)}ms`);

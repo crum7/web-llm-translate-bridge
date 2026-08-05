@@ -19,7 +19,7 @@ async function ensureContentScript(tabId) {
 async function send(action, payload) {
   const tab = await activeTab();
   await ensureContentScript(tab.id);
-  const { target } = await chrome.storage.sync.get({ target: "ja" });
+  const { target, model } = await chrome.storage.sync.get({ target: "ja", model: "sonnet" });
   const settings = await chrome.storage.sync.get({
     bridgeUrl: "http://127.0.0.1:17891",
     token: "",
@@ -27,6 +27,7 @@ async function send(action, payload) {
   return chrome.tabs.sendMessage(tab.id, {
     action,
     target: payload?.target || target,
+    model: payload?.model || model,
     bridgeUrl: settings.bridgeUrl,
     token: settings.token,
     tabId: tab.id,
@@ -82,10 +83,11 @@ window.addEventListener("unload", () => clearInterval(pollId));
 
 $("go").addEventListener("click", async () => {
   const target = $("target").value;
-  await chrome.storage.sync.set({ target });
+  const model = $("model").value;
+  await chrome.storage.sync.set({ target, model });
   renderStatus({ kind: "progress", current: 0, total: "?" });
   try {
-    const res = await send("translate", { target });
+    const res = await send("translate", { target, model });
     if (res?.ok) renderStatus({ kind: "done", count: res.count });
     else renderStatus({ kind: "failed", error: res?.error || "unknown" });
   } catch (e) {
@@ -132,7 +134,8 @@ $("diag").addEventListener("click", async () => {
   }
 });
 
-// Load last-used target
-chrome.storage.sync.get({ target: "ja" }).then(({ target }) => {
+// Load last-used target and model
+chrome.storage.sync.get({ target: "ja", model: "sonnet" }).then(({ target, model }) => {
   $("target").value = target;
+  $("model").value = model;
 });
