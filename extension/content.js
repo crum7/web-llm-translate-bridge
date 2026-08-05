@@ -43,6 +43,7 @@
     observer: null,          // MutationObserver
     reTranslateTimer: null,  // debounce timer
     inFlightRetranslate: false,
+    lastUrl: null,           // SPA route-change detection
   };
   const state = window.__llmTranslateBridge;
 
@@ -150,54 +151,64 @@
   const PLACEHOLDER_RE = /⟦(\d+)⟧/g;
 
   /**
-   * Find translatable block elements. A block is captured if:
-   *   - it's in BLOCK_TAGS, AND
-   *   - it contains meaningful text, AND
-   *   - it does NOT contain any nested block-tag descendant with text
-   *     (nested-block case: we descend and capture the inner block instead)
+   * Find translatable block elements. Simple full-DOM walk:
+   *   1. Skip subtrees rooted at SKIP_TAGS.
+   *   2. For every element that IS a BLOCK_TAG:
+   *      - If it has any BLOCK_TAG descendant with real text, skip capturing
+   *        THIS one (we'll capture the inner block(s) instead). Still descend.
+   *      - Otherwise, if it has real text of its own, capture it.
+   *   3. Always descend into children of non-SKIP elements.
    *
-   * Non-block elements (e.g. <div>, <section>) are transparent — we recurse into
-   * their children individually. This is the key fix vs v0.8: a <div> mixing a
-   * <p> sibling with a <ul> sibling used to lose the <p> because the presence
-   * of <ul> made us skip the whole <div>'s children iteration.
+   * This replaces v0.10..v0.12's early-return logic which was silently
+   * losing <p> nodes on certain DOM shapes (confirmed via popup diagnostic
+   * showing a valid <p> at depth 17 that findBlocks couldn't find).
    */
   function findBlocks(root) {
     const blocks = [];
+    const captured = new WeakSet();
 
-    function hasNestedBlockWithText(el) {
-      for (const c of el.children) {
+    // Pre-pass: mark all BLOCK ancestors of any captured text-holder so we
+    // don't double-capture. Actually simpler: do it inline via hasNestedBlock.
+    function hasBlockDescendantWithText(el) {
+      // BFS one level at a time (not recursive) — cheaper on huge trees.
+      const stack = Array.from(el.children);
+      while (stack.length) {
+        const c = stack.pop();
+        if (!c || !c.tagName) continue;
         if (SKIP_TAGS.has(c.tagName)) continue;
-        if (BLOCK_TAGS.has(c.tagName) && c.textContent.trim().length >= 2) return true;
-        if (hasNestedBlockWithText(c)) return true;
+        if (BLOCK_TAGS.has(c.tagName)) {
+          const t = c.textContent && c.textContent.trim();
+          if (t && t.length >= 2 && /\p{L}/u.test(t)) return true;
+        }
+        for (const cc of c.children) stack.push(cc);
       }
       return false;
     }
 
-    function visit(el) {
-      if (!el) return;
-      const tag = el.tagName;
-      if (!tag || SKIP_TAGS.has(tag)) return;
+    function walk(el) {
+      if (!el || !el.tagName) return;
+      if (SKIP_TAGS.has(el.tagName)) return;
       if (el.isContentEditable) return;
 
-      if (BLOCK_TAGS.has(tag)) {
-        // This IS a block. If it has nested blocks (e.g. <li> containing <p>),
-        // prefer the inner blocks; otherwise capture this one.
-        if (hasNestedBlockWithText(el)) {
-          for (const c of el.children) visit(c);
-          return;
+      if (BLOCK_TAGS.has(el.tagName)) {
+        const txt = el.textContent ? el.textContent.trim() : "";
+        const hasLetters = /\p{L}/u.test(txt);
+        // Only skip THIS block if it wraps other blocks (e.g. <li> containing <p>).
+        // Otherwise capture it — even if children include inline stuff.
+        if (!hasBlockDescendantWithText(el)) {
+          if (hasLetters && txt.length >= 2 && !captured.has(el)) {
+            blocks.push(el);
+            captured.add(el);
+          }
+          return; // no need to descend — this block has no inner blocks
         }
-        const txt = el.textContent.trim();
-        if (txt.length >= 2 && /\p{L}/u.test(txt)) blocks.push(el);
-        return; // don't descend past a captured block
+        // wraps other blocks — descend, don't capture self
       }
 
-      // Non-block container (<div>, <section>, <article>, <main>, ...):
-      // ALWAYS descend into every child independently. This is what was broken
-      // in v0.8 — sibling <p> got dropped when a <ul> sibling existed.
-      for (const c of el.children) visit(c);
+      for (const c of el.children) walk(c);
     }
 
-    visit(root);
+    walk(root);
     return blocks;
   }
 
@@ -403,16 +414,30 @@
   /**
    * Watch the DOM for new translatable blocks and translate them automatically.
    * Debounced 800ms so bursts of mutations coalesce into one re-run.
+   * Also watches for SPA URL changes (Vue Router history.pushState) and
+   * resets state on route change so we re-scan the fresh page from scratch.
    */
   function startObserver() {
-    if (state.observer) return; // already watching
-    state.observer = new MutationObserver(() => scheduleReTranslate());
+    if (state.observer) return;
+    state.observer = new MutationObserver(() => {
+      // Detect SPA route change: URL changed but no full page load.
+      if (state.lastUrl && state.lastUrl !== location.href) {
+        console.log(`[llm-translate] SPA route change: ${state.lastUrl} -> ${location.href}`);
+        // Wipe per-page state: cached blocks refer to the old DOM's elements,
+        // which no longer exist. Keep the in-memory translation cache — text
+        // that repeats across pages is still valid.
+        state.blocks = [];
+        state.lastUrl = location.href;
+      }
+      scheduleReTranslate();
+    });
     state.observer.observe(document.body, {
       childList: true,
       subtree: true,
       characterData: false,
     });
-    console.log("[llm-translate] MutationObserver armed");
+    state.lastUrl = location.href;
+    console.log("[llm-translate] MutationObserver armed at", state.lastUrl);
   }
 
   function scheduleReTranslate() {
