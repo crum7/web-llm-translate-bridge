@@ -326,34 +326,65 @@
     }
 
     // Try to locate the specific paragraph the user reported.
+    // Walk the whole DOM and find the DEEPEST element whose textContent contains
+    // the keyword — that's the actual paragraph, not <html> or <div id="app">.
     let targetInfo = "検索キーワード未指定";
     const keyword = (msg?.searchText || "Lateral Movement is a tactic").slice(0, 100);
     if (keyword) {
-      const paras = document.querySelectorAll("p, div, li, td, span");
-      let hit = null;
-      for (const p of paras) {
-        if (p.textContent && p.textContent.includes(keyword)) { hit = p; break; }
+      const all = document.querySelectorAll("*");
+      let deepest = null;
+      let deepestDepth = -1;
+      for (const el of all) {
+        if (!el.textContent || !el.textContent.includes(keyword)) continue;
+        // Skip elements that also have a child matching — we want the innermost.
+        let hasChildMatch = false;
+        for (const c of el.children) {
+          if (c.textContent && c.textContent.includes(keyword)) { hasChildMatch = true; break; }
+        }
+        if (hasChildMatch) continue;
+        // Compute depth from body
+        let d = 0, cur = el;
+        while (cur && cur !== document.body) { d++; cur = cur.parentElement; }
+        if (d > deepestDepth) { deepestDepth = d; deepest = el; }
       }
+      const hit = deepest;
       if (!hit) {
         targetInfo = `"${keyword}" を含む要素: 見つからず`;
       } else {
         const inBlocks = state.blocks.some((b) => b.el === hit);
         const inCurrentScan = currentBlocks.includes(hit);
+        // Walk up to find the nearest BLOCK_TAG ancestor
+        let blockAncestor = hit;
+        while (blockAncestor && !BLOCK_TAGS.has(blockAncestor.tagName)) {
+          blockAncestor = blockAncestor.parentElement;
+        }
         const parentChain = [];
         let cur = hit;
-        for (let i = 0; i < 5 && cur; i++) {
-          parentChain.push(`${cur.tagName}${cur.className ? "." + String(cur.className).split(" ").join(".") : ""}`);
+        for (let i = 0; i < 8 && cur; i++) {
+          const cls = cur.className && typeof cur.className === "string"
+            ? "." + cur.className.split(/\s+/).slice(0, 3).join(".")
+            : "";
+          parentChain.push(`${cur.tagName}${cls}`);
           cur = cur.parentElement;
         }
+        const hasSkipAncestor = (() => {
+          let c = hit;
+          while (c) { if (SKIP_TAGS.has(c.tagName)) return c.tagName; c = c.parentElement; }
+          return null;
+        })();
         targetInfo = [
           `キーワード: "${keyword}"`,
-          `見つかった: ${hit.tagName}`,
-          `祖先チェーン: ${parentChain.join(" > ")}`,
-          `findBlocks で拾えるか (今再スキャン): ${inCurrentScan ? "YES" : "NO ← ここが原因"}`,
+          `見つかった要素: <${hit.tagName}> (深さ${deepestDepth})`,
+          `祖先チェーン (下から): ${parentChain.join(" > ")}`,
+          `最寄りのBLOCK_TAG祖先: ${blockAncestor ? `<${blockAncestor.tagName}>` : "見つからず"}`,
+          `SKIP_TAGS祖先: ${hasSkipAncestor || "なし"}`,
+          `findBlocks で今この要素を拾えるか: ${inCurrentScan ? "YES" : "NO"}`,
+          blockAncestor && blockAncestor !== hit ? `※ BLOCK祖先 <${blockAncestor.tagName}> が findBlocks で拾えるか: ${currentBlocks.includes(blockAncestor) ? "YES" : "NO"}` : "",
           `過去の翻訳実行で touched?: ${inBlocks ? "YES" : "NO"}`,
-          `outerHTML先頭200字:`,
-          hit.outerHTML.slice(0, 200),
-        ].join("\n");
+          ``,
+          `outerHTML先頭400字:`,
+          hit.outerHTML.slice(0, 400),
+        ].filter(Boolean).join("\n");
       }
     }
 
