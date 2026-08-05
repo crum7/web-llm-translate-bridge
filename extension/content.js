@@ -79,13 +79,15 @@
     let bi = 0;
 
     console.log(`[llm-translate] ${nodes.length} nodes → ${batches.length} batch(es)`);
+    // initial progress (batch 0 / total, so the badge shows up immediately)
+    safeSend({ progress: { current: 0, total: batches.length } });
+
     for (const batch of batches) {
       bi++;
       const texts = batch.map((n) => n.nodeValue);
       const t0 = performance.now();
       console.log(`[llm-translate] batch ${bi}/${batches.length} (${texts.length} snippets) → POST ${bridgeUrl}/translate`);
-      // notify popup of progress via runtime message (fire-and-forget)
-      try { chrome.runtime.sendMessage({ progress: { current: bi, total: batches.length } }); } catch {}
+      safeSend({ progress: { current: bi, total: batches.length } });
       let translations;
       try {
         translations = await translateBatch(texts, { bridgeUrl, token, target });
@@ -104,7 +106,15 @@
       done += batch.length;
     }
     console.log(`[llm-translate] done: ${done}/${nodes.length}`);
+    safeSend({ done: { count: done } });
     return { ok: true, count: done };
+  }
+
+  // fire-and-forget message to the service worker (never let it throw)
+  function safeSend(payload) {
+    try {
+      chrome.runtime.sendMessage(payload).catch(() => {});
+    } catch {}
   }
 
   function doRestore() {
@@ -113,6 +123,7 @@
       if (typeof orig === "string") node.nodeValue = orig;
     }
     state.touched = [];
+    safeSend({ reset: {} });
     return { ok: true };
   }
 
@@ -128,6 +139,7 @@
           sendResponse({ ok: false, error: "unknown action" });
         }
       } catch (e) {
+        safeSend({ failed: { error: e.message } });
         sendResponse({ ok: false, error: e.message });
       }
     })();

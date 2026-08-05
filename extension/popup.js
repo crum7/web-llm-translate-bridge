@@ -29,33 +29,72 @@ async function send(action, payload) {
     target: payload?.target || target,
     bridgeUrl: settings.bridgeUrl,
     token: settings.token,
+    tabId: tab.id,
   });
 }
 
-// Listen for progress pings from content.js
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg?.progress) {
-    const { current, total } = msg.progress;
-    $("status").textContent = `翻訳中… ${current}/${total} バッチ`;
+function renderStatus(state) {
+  if (!state || state.kind === "idle") {
+    $("status").textContent = "";
+    return;
   }
+  if (state.kind === "progress") {
+    const { current, total } = state;
+    if (current === 0) $("status").textContent = `翻訳準備中… (${total} バッチ)`;
+    else $("status").textContent = `翻訳中… ${current}/${total} バッチ`;
+    return;
+  }
+  if (state.kind === "done") {
+    $("status").textContent = `${state.count}件 翻訳完了`;
+    return;
+  }
+  if (state.kind === "failed") {
+    $("status").textContent = `エラー: ${state.error || "unknown"}`;
+    return;
+  }
+}
+
+// Restore state on popup open (survives popup close/reopen)
+(async () => {
+  const tab = await activeTab();
+  const key = `state:${tab.id}`;
+  const stored = await chrome.storage.session.get(key);
+  renderStatus(stored[key]);
+})();
+
+// Live updates while popup is open
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg?.progress) renderStatus({ kind: "progress", ...msg.progress });
+  else if (msg?.done) renderStatus({ kind: "done", ...msg.done });
+  else if (msg?.failed) renderStatus({ kind: "failed", ...msg.failed });
+  else if (msg?.reset) renderStatus({ kind: "idle" });
 });
+
+// Also poll storage while popup is open, since sendMessage from content scripts
+// during a long batch can race with popup mount.
+const pollId = setInterval(async () => {
+  const tab = await activeTab();
+  const key = `state:${tab.id}`;
+  const stored = await chrome.storage.session.get(key);
+  if (stored[key]) renderStatus(stored[key]);
+}, 1000);
+window.addEventListener("unload", () => clearInterval(pollId));
 
 $("go").addEventListener("click", async () => {
   const target = $("target").value;
   await chrome.storage.sync.set({ target });
-  $("status").textContent = "翻訳中… 準備";
+  renderStatus({ kind: "progress", current: 0, total: "?" });
   try {
     const res = await send("translate", { target });
-    $("status").textContent = res?.ok
-      ? `${res.count}件 翻訳完了`
-      : `エラー: ${res?.error || "unknown"}`;
+    if (res?.ok) renderStatus({ kind: "done", count: res.count });
+    else renderStatus({ kind: "failed", error: res?.error || "unknown" });
   } catch (e) {
-    $("status").textContent = `エラー: ${e.message}`;
+    renderStatus({ kind: "failed", error: e.message });
   }
 });
 
 $("restore").addEventListener("click", async () => {
-  $("status").textContent = "";
+  renderStatus({ kind: "idle" });
   await send("restore");
 });
 

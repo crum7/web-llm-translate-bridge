@@ -3,7 +3,7 @@
   "name": "LLM Translate (Claude Bridge)",
   "version": "0.1.0",
   "description": "Translate the whole page in-place using a local Claude Code bridge.",
-  "permissions": ["activeTab", "storage", "scripting"],
+  "permissions": ["activeTab", "storage", "scripting", "tabs"],
   "host_permissions": [
     "<all_urls>",
     "http://127.0.0.1:17891/*",
