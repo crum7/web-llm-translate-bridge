@@ -460,6 +460,7 @@
         if (msg.action === "translate") sendResponse(await doTranslate(msg));
         else if (msg.action === "restore") sendResponse(doRestore());
         else if (msg.action === "diagnostic") sendResponse({ ok: true, diag: collectDiagnostic(msg) });
+        else if (msg.action === "buildMarkdown") sendResponse(await doBuildMarkdown(msg));
         else sendResponse({ ok: false, error: "unknown action" });
       } catch (e) {
         safeSend({ failed: { error: e.message } });
@@ -468,6 +469,135 @@
     })();
     return true;
   });
+
+  // -----------------------------------------------------------------
+  // Copy-as-Markdown: takes the CURRENT (translated) DOM of the main
+  // content area, converts to Markdown via turndown, inlines images as
+  // base64, prepends a metadata header.
+  // -----------------------------------------------------------------
+  async function doBuildMarkdown(_msg) {
+    if (typeof TurndownService === "undefined") {
+      return { ok: false, error: "turndown 未ロード" };
+    }
+
+    // 1. Locate the main content region.
+    const mainEl = findMainContent();
+    if (!mainEl) return { ok: false, error: "本文エリアが見つからない" };
+
+    // 2. Deep-clone so we can rewrite <img> src to base64 without polluting the page.
+    const clone = mainEl.cloneNode(true);
+
+    // 3. Inline all images as base64 (in parallel). Skip data: URLs (already inlined).
+    const imgs = Array.from(clone.querySelectorAll("img"));
+    const results = await Promise.allSettled(imgs.map(async (img) => {
+      const src = img.getAttribute("src");
+      if (!src || src.startsWith("data:")) return;
+      try {
+        const dataUrl = await fetchAsDataUrl(new URL(src, location.href).href);
+        img.setAttribute("src", dataUrl);
+      } catch (e) {
+        // Leave the original src (turndown will emit ![](http_url) as fallback).
+        console.warn(`[llm-translate] image inline failed: ${src}`, e.message);
+      }
+    }));
+    const imageOk = results.filter((r) => r.status === "fulfilled").length;
+
+    // 4. Configure turndown.
+    const td = new TurndownService({
+      headingStyle: "atx",           // # H1 / ## H2
+      codeBlockStyle: "fenced",      // ```
+      bulletListMarker: "-",
+      emDelimiter: "*",
+      strongDelimiter: "**",
+      linkStyle: "inlined",
+    });
+    // Preserve GFM tables (turndown drops <table> by default).
+    td.addRule("table", {
+      filter: "table",
+      replacement: (_content, node) => htmlTableToMarkdown(node),
+    });
+    // Strip <button> / <nav> / <script> / <style> that snuck in.
+    td.remove(["script", "style", "nav", "button", "aside", "iframe"]);
+
+    const bodyMd = td.turndown(clone.innerHTML).trim();
+
+    // 5. Build the header.
+    const title = (document.title || "").trim() || "(タイトルなし)";
+    const url = location.href;
+    const now = new Date();
+    const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    const header = [
+      `# ${title}`,
+      ``,
+      `> 出典: ${url}`,
+      `> 取得日: ${dateStr}`,
+      ``,
+      `---`,
+      ``,
+    ].join("\n");
+
+    const markdown = header + bodyMd + "\n";
+    console.log(`[llm-translate] markdown built: ${markdown.length} chars, ${imageOk}/${imgs.length} images inlined`);
+    return { ok: true, markdown, imageCount: imageOk };
+  }
+
+  // Auto-detect the main text container. Preference order:
+  //   .markdown-content -> <article> -> <main> -> <body>
+  function findMainContent() {
+    const candidates = [
+      ".markdown-content",     // offsec.com uses this
+      "article",
+      "main",
+      "[role='main']",
+      "#content",
+      ".content",
+    ];
+    for (const sel of candidates) {
+      const el = document.querySelector(sel);
+      if (el && el.textContent.trim().length > 200) return el;
+    }
+    return document.body;
+  }
+
+  // Fetch a URL and return a data: URL. Uses fetch (respects CORS) and FileReader.
+  function fetchAsDataUrl(url) {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const res = await fetch(url, { credentials: "include" });
+        if (!res.ok) return reject(new Error(`HTTP ${res.status}`));
+        const blob = await res.blob();
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(blob);
+      } catch (e) { reject(e); }
+    });
+  }
+
+  // Minimal GFM table converter. Handles <thead>/<tbody>, falls back to first
+  // row as header if no <thead>.
+  function htmlTableToMarkdown(table) {
+    const rows = Array.from(table.querySelectorAll("tr"));
+    if (rows.length === 0) return "";
+    const cellsOf = (tr) => Array.from(tr.querySelectorAll("th,td")).map((c) => c.textContent.replace(/\s+/g, " ").trim());
+    const headerFromThead = table.querySelector("thead tr");
+    let headers, bodyRows;
+    if (headerFromThead) {
+      headers = cellsOf(headerFromThead);
+      bodyRows = rows.filter((r) => !headerFromThead.contains(r) && r !== headerFromThead).map(cellsOf);
+    } else {
+      headers = cellsOf(rows[0]);
+      bodyRows = rows.slice(1).map(cellsOf);
+    }
+    const width = headers.length;
+    const sep = "| " + Array(width).fill("---").join(" | ") + " |";
+    const head = "| " + headers.join(" | ") + " |";
+    const body = bodyRows.map((r) => {
+      const padded = r.concat(Array(Math.max(0, width - r.length)).fill(""));
+      return "| " + padded.slice(0, width).join(" | ") + " |";
+    }).join("\n");
+    return "\n" + [head, sep, body].join("\n") + "\n";
+  }
 
   /**
    * Snapshot of the page's translation state — for the popup Diagnostic button

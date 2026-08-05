@@ -7,9 +7,11 @@ async function activeTab() {
 
 async function ensureContentScript(tabId) {
   try {
+    // turndown.js is a plain IIFE that assigns globalThis.TurndownService.
+    // Inject into the same ISOLATED world as content.js so content.js can see it.
     await chrome.scripting.executeScript({
       target: { tabId },
-      files: ["content.js"],
+      files: ["vendor/turndown.js", "content.js"],
     });
   } catch (e) {
     // already injected — ignore
@@ -98,6 +100,28 @@ $("go").addEventListener("click", async () => {
 $("restore").addEventListener("click", async () => {
   renderStatus({ kind: "idle" });
   await send("restore");
+});
+
+// Copy-as-Markdown button
+$("copyMd").addEventListener("click", async () => {
+  $("status").textContent = "Markdown生成中…";
+  try {
+    const tab = await activeTab();
+    await ensureContentScript(tab.id);
+    // First, tell content.js to build the markdown and hand it back.
+    const res = await chrome.tabs.sendMessage(tab.id, { action: "buildMarkdown" });
+    if (!res?.ok) {
+      $("status").textContent = `エラー: ${res?.error || "unknown"}`;
+      return;
+    }
+    // Clipboard write must happen in the popup (has user-gesture context).
+    // The offscreen document approach isn't needed here because popup is a
+    // real DOM with an active gesture from the button click.
+    await navigator.clipboard.writeText(res.markdown);
+    $("status").textContent = `コピーしました (${res.markdown.length.toLocaleString()}文字, 画像${res.imageCount}枚)`;
+  } catch (e) {
+    $("status").textContent = `エラー: ${e.message}`;
+  }
 });
 
 // Diagnostic button: dump content-script state into the popup, no DevTools required.
