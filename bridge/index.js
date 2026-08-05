@@ -114,20 +114,77 @@ app.post("/translate", async (req, res) => {
   }
 
   console.log(`[tr  ] ${texts.length} snippet(s), target=${target}, first="${texts[0].slice(0, 60)}..."`);
-  const prompt = buildPrompt(texts, source, target);
-  const t0 = Date.now();
 
   try {
-    const raw = await runClaude(prompt);
-    console.log(`[tr  ] claude returned ${raw.length} chars in ${Date.now() - t0}ms`);
-    const translations = parseTranslations(raw, texts.length);
-    console.log(`[tr  ] parsed ${translations.length} translations, first="${translations[0]?.slice(0, 60)}..."`);
+    const translations = await translateWithBisection(texts, source, target);
+    console.log(`[tr  ] final ${translations.length} translations, first="${translations[0]?.slice(0, 60)}..."`);
     res.json({ translations });
   } catch (err) {
     console.error("[translate] error:", err);
     res.status(500).json({ error: String(err?.message || err) });
   }
 });
+
+/**
+ * Try to translate `texts` in one call. If Claude returns a partial/no parse,
+ * bisect the batch and translate halves independently, recursively down to size 1.
+ * Guarantees every input gets translated OR at worst falls back to the original.
+ */
+async function translateWithBisection(texts, source, target, depth = 0) {
+  const prompt = buildPrompt(texts, source, target);
+  const t0 = Date.now();
+  let raw;
+  try {
+    raw = await runClaude(prompt);
+  } catch (e) {
+    // Claude CLI itself blew up (rate limit, timeout, ...). Bisect if we can.
+    if (texts.length > 1) return bisect(texts, source, target, depth);
+    console.warn(`[tr  ] single-item translate failed at depth ${depth}, using original: ${e.message}`);
+    return [texts[0]];
+  }
+  console.log(`[tr  ] [d${depth}] claude returned ${raw.length} chars in ${Date.now() - t0}ms for ${texts.length} items`);
+
+  try {
+    return parseTranslations(raw, texts.length);
+  } catch (e) {
+    if (e.partialParse && texts.length > 1) {
+      // We got SOME results. Reuse them where present, only retry the missing indexes.
+      console.warn(`[tr  ] [d${depth}] partial: filling gaps via bisection`);
+      const parsed = e.parsed;
+      const missingIdx = [];
+      for (let i = 0; i < texts.length; i++) if (parsed[i] === null) missingIdx.push(i);
+      const gapTexts = missingIdx.map((i) => texts[i]);
+      const gapResults = await bisect(gapTexts, source, target, depth + 1);
+      const out = parsed.slice();
+      missingIdx.forEach((i, j) => (out[i] = gapResults[j] ?? texts[i]));
+      return out.map((v, i) => (v == null ? texts[i] : String(v)));
+    }
+    if (e.parseFailed && texts.length > 1) {
+      console.warn(`[tr  ] [d${depth}] no blocks parsed, bisecting`);
+      return bisect(texts, source, target, depth);
+    }
+    // Single item that couldn't be parsed → fall back to original text.
+    console.warn(`[tr  ] [d${depth}] giving up on item, using original: ${e.message}`);
+    return texts.slice();
+  }
+}
+
+async function bisect(texts, source, target, depth) {
+  if (texts.length === 0) return [];
+  if (texts.length === 1) {
+    // One item that failed — return original so the page at least shows something.
+    return [texts[0]];
+  }
+  const mid = Math.floor(texts.length / 2);
+  const left = texts.slice(0, mid);
+  const right = texts.slice(mid);
+  // Parallel halves for speed.
+  const [lRes, rRes] = await Promise.all([
+    translateWithBisection(left, source, target, depth + 1),
+    translateWithBisection(right, source, target, depth + 1),
+  ]);
+  return [...lRes, ...rRes];
+}
 
 // Use a hard delimiter format instead of JSON.
 // LLMs are far more reliable at "print one translation per block separated by <<<END>>>"
@@ -204,16 +261,22 @@ function parseTranslations(raw, expectedLen) {
   }
 
   if (matched === 0) {
-    // Last-ditch: legacy JSON array fallback (in case someone flips MODEL back to opus
-    // and it emits the old shape).
     const arr = tryJson(raw.trim()) || (raw.match(/\[[\s\S]*\]/) && tryJson(raw.match(/\[[\s\S]*\]/)[0]));
     if (arr && arr.length === expectedLen) return arr.map(String);
-    throw new Error(`failed to parse translations: 0/${expectedLen} delimited blocks found.\nraw: ${raw.slice(0, 400)}`);
+    // Signal to the caller that we couldn't parse anything (they'll retry smaller).
+    const err = new Error(`no delimited blocks parsed (0/${expectedLen})`);
+    err.parseFailed = true;
+    err.rawPreview = raw.slice(0, 400);
+    throw err;
   }
 
   if (matched < expectedLen) {
-    console.warn(`[translate] partial parse: got ${matched}/${expectedLen} blocks (missing indexes filled with empty)`);
-    for (let i = 0; i < expectedLen; i++) if (out[i] === null) out[i] = "";
+    // Signal a partial parse so caller can retry the missing indexes.
+    console.warn(`[translate] partial parse: got ${matched}/${expectedLen}`);
+    const err = new Error(`partial parse: ${matched}/${expectedLen} blocks`);
+    err.partialParse = true;
+    err.parsed = out.slice(); // some entries still null
+    throw err;
   }
   return out.map(String);
 }

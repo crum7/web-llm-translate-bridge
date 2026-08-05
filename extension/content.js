@@ -215,7 +215,11 @@
     );
 
     // 3. Batch + parallel translate the unique strings.
-    const BATCH = 50;
+    // BATCH=30: 50 was the sweet spot for speed but Sonnet dropped ~20% of items on
+    //           dense technical prose. 30 keeps parse discipline much higher.
+    //           Bridge now bisects on partial parse, so even 30 is safe fallback.
+    // CONCURRENCY=10: leaves headroom in the Max 5h window and dodges 429/529.
+    const BATCH = 30;
     const CONCURRENCY = 10;
     const batches = chunk(uniqueTexts, BATCH);
     let completed = 0;
