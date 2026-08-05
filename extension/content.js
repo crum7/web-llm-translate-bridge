@@ -292,6 +292,7 @@
       try {
         if (msg.action === "translate") sendResponse(await doTranslate(msg));
         else if (msg.action === "restore") sendResponse(doRestore());
+        else if (msg.action === "diagnostic") sendResponse({ ok: true, diag: collectDiagnostic(msg) });
         else sendResponse({ ok: false, error: "unknown action" });
       } catch (e) {
         safeSend({ failed: { error: e.message } });
@@ -300,4 +301,69 @@
     })();
     return true;
   });
+
+  /**
+   * Snapshot of the page's translation state — for the popup Diagnostic button
+   * (so we don't need DevTools on sites with aggressive anti-debug).
+   */
+  function collectDiagnostic(msg) {
+    // Re-run findBlocks so we see what WOULD be picked up right now,
+    // even if the user hasn't hit Translate yet.
+    let currentBlocks = [];
+    try { currentBlocks = findBlocks(document.body); } catch {}
+
+    // Any block that still contains a lot of ASCII letters and few CJK chars is
+    // probably untranslated. Threshold: ≥30 latin chars and <3 CJK chars.
+    const stillEnglish = [];
+    for (const el of currentBlocks) {
+      const txt = el.textContent.trim();
+      if (txt.length < 40) continue;
+      const latin = (txt.match(/[A-Za-z]/g) || []).length;
+      const cjk = (txt.match(/[\u3040-\u30ff\u4e00-\u9fff]/g) || []).length;
+      if (latin >= 30 && cjk < 3) {
+        stillEnglish.push({ tag: el.tagName, text: txt });
+      }
+    }
+
+    // Try to locate the specific paragraph the user reported.
+    let targetInfo = "検索キーワード未指定";
+    const keyword = (msg?.searchText || "Lateral Movement is a tactic").slice(0, 100);
+    if (keyword) {
+      const paras = document.querySelectorAll("p, div, li, td, span");
+      let hit = null;
+      for (const p of paras) {
+        if (p.textContent && p.textContent.includes(keyword)) { hit = p; break; }
+      }
+      if (!hit) {
+        targetInfo = `"${keyword}" を含む要素: 見つからず`;
+      } else {
+        const inBlocks = state.blocks.some((b) => b.el === hit);
+        const inCurrentScan = currentBlocks.includes(hit);
+        const parentChain = [];
+        let cur = hit;
+        for (let i = 0; i < 5 && cur; i++) {
+          parentChain.push(`${cur.tagName}${cur.className ? "." + String(cur.className).split(" ").join(".") : ""}`);
+          cur = cur.parentElement;
+        }
+        targetInfo = [
+          `キーワード: "${keyword}"`,
+          `見つかった: ${hit.tagName}`,
+          `祖先チェーン: ${parentChain.join(" > ")}`,
+          `findBlocks で拾えるか (今再スキャン): ${inCurrentScan ? "YES" : "NO ← ここが原因"}`,
+          `過去の翻訳実行で touched?: ${inBlocks ? "YES" : "NO"}`,
+          `outerHTML先頭200字:`,
+          hit.outerHTML.slice(0, 200),
+        ].join("\n");
+      }
+    }
+
+    return {
+      url: location.href,
+      hasState: !!window.__llmTranslateBridge,
+      blocksCount: state.blocks.length,
+      cacheSize: state.cache.size,
+      stillEnglish,
+      targetInfo,
+    };
+  }
 })();

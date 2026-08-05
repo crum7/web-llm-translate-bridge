@@ -98,6 +98,40 @@ $("restore").addEventListener("click", async () => {
   await send("restore");
 });
 
+// Diagnostic button: dump content-script state into the popup, no DevTools required.
+$("diag").addEventListener("click", async () => {
+  const out = $("diagOut");
+  out.style.display = "block";
+  out.textContent = "収集中…";
+  try {
+    const tab = await activeTab();
+    await ensureContentScript(tab.id);
+    const res = await chrome.tabs.sendMessage(tab.id, { action: "diagnostic" });
+    if (!res?.ok) {
+      out.textContent = `診断失敗: ${res?.error || "no response"}`;
+      return;
+    }
+    const d = res.diag;
+    const lines = [
+      `URL: ${d.url}`,
+      `bridge state: ${d.hasState ? "OK" : "MISSING (content.js未注入)"}`,
+      `blocks総数: ${d.blocksCount}`,
+      `cache件数: ${d.cacheSize}`,
+      ``,
+      `--- 翻訳漏れチェック (英語のまま残ってるブロック) ---`,
+      `原文英語のまま残: ${d.stillEnglish.length}件`,
+      ``,
+      ...d.stillEnglish.slice(0, 20).map((s, i) => `[${i}] <${s.tag}> ${s.text.slice(0, 100)}`),
+      ``,
+      `--- 対象パラグラフ検索 ---`,
+      d.targetInfo,
+    ];
+    out.textContent = lines.join("\n");
+  } catch (e) {
+    out.textContent = `エラー: ${e.message}`;
+  }
+});
+
 // Load last-used target
 chrome.storage.sync.get({ target: "ja" }).then(({ target }) => {
   $("target").value = target;
