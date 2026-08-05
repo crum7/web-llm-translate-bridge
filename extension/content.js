@@ -93,39 +93,52 @@
     const nodes = collectTextNodes(document.body);
     if (nodes.length === 0) return { ok: true, count: 0 };
 
-    // Batch size: keep prompts under a few KB. 40 snippets per call is a decent default.
-    const BATCH = 40;
+    // Smaller batches = LLM keeps JSON discipline better. 20 works well for Sonnet.
+    // CONCURRENCY = how many batches run in parallel against the bridge.
+    // Sonnet 4.5 with Max subscription can handle 10 concurrent easily.
+    const BATCH = 20;
+    const CONCURRENCY = 10;
     const batches = chunk(nodes, BATCH);
     let done = 0;
-    let bi = 0;
+    let completed = 0;
 
-    console.log(`[llm-translate] ${nodes.length} nodes → ${batches.length} batch(es)`);
-    // initial progress (batch 0 / total, so the badge shows up immediately)
+    console.log(`[llm-translate] ${nodes.length} nodes → ${batches.length} batch(es), concurrency=${CONCURRENCY}`);
     safeSend({ progress: { current: 0, total: batches.length } });
 
-    for (const batch of batches) {
-      bi++;
-      const texts = batch.map((n) => n.nodeValue);
-      const t0 = performance.now();
-      console.log(`[llm-translate] batch ${bi}/${batches.length} (${texts.length} snippets) → POST ${bridgeUrl}/translate`);
-      safeSend({ progress: { current: bi, total: batches.length } });
-      let translations;
-      try {
-        translations = await translateBatch(texts, { bridgeUrl, token, target });
-      } catch (e) {
-        console.error(`[llm-translate] batch ${bi} failed:`, e);
-        continue;
+    // Worker pool: pull from a shared queue until empty
+    const queue = batches.map((b, i) => ({ batch: b, idx: i + 1 }));
+    async function worker(workerId) {
+      while (queue.length > 0) {
+        const job = queue.shift();
+        if (!job) break;
+        const { batch, idx } = job;
+        const texts = batch.map((n) => n.nodeValue);
+        const t0 = performance.now();
+        console.log(`[llm-translate] [w${workerId}] batch ${idx}/${batches.length} (${texts.length}) → POST`);
+        let translations;
+        try {
+          translations = await translateBatch(texts, { bridgeUrl, token, target });
+        } catch (e) {
+          console.error(`[llm-translate] [w${workerId}] batch ${idx} failed:`, e);
+          completed++;
+          safeSend({ progress: { current: completed, total: batches.length } });
+          continue;
+        }
+        console.log(`[llm-translate] [w${workerId}] batch ${idx} ok in ${Math.round(performance.now() - t0)}ms`);
+        batch.forEach((node, i) => {
+          const t = translations[i];
+          if (typeof t !== "string") return;
+          if (!state.originals.has(node)) state.originals.set(node, node.nodeValue);
+          node.nodeValue = t;
+          state.touched.push(node);
+        });
+        done += batch.length;
+        completed++;
+        safeSend({ progress: { current: completed, total: batches.length } });
       }
-      console.log(`[llm-translate] batch ${bi} ok in ${Math.round(performance.now() - t0)}ms`);
-      batch.forEach((node, i) => {
-        const t = translations[i];
-        if (typeof t !== "string") return;
-        if (!state.originals.has(node)) state.originals.set(node, node.nodeValue);
-        node.nodeValue = t;
-        state.touched.push(node);
-      });
-      done += batch.length;
     }
+    await Promise.all(Array.from({ length: CONCURRENCY }, (_, i) => worker(i + 1)));
+
     console.log(`[llm-translate] done: ${done}/${nodes.length}`);
     safeSend({ done: { count: done } });
     return { ok: true, count: done };

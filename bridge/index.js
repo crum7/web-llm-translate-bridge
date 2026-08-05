@@ -21,7 +21,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const MODE = process.env.MODE || "tailscale";
 const PORT = Number(process.env.PORT || 17891);
-const MODEL = process.env.MODEL || "opus";
+const MODEL = process.env.MODEL || "sonnet";
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
 const TAILSCALE_IP = process.env.TAILSCALE_IP || "100.104.251.67";
 const TAILSCALE_HOST = process.env.TAILSCALE_HOST || "home-tuyotuyo.tailf8de78.ts.net";
@@ -129,25 +129,40 @@ app.post("/translate", async (req, res) => {
   }
 });
 
+// Use a hard delimiter format instead of JSON.
+// LLMs are far more reliable at "print one translation per block separated by <<<END>>>"
+// than at emitting a syntactically valid JSON array of N strings.
+const DELIM = "<<<LLMT-END>>>";
+
 function buildPrompt(texts, source, target) {
-  const numbered = texts.map((t, i) => `[${i}] ${t}`).join("\n---\n");
+  const numbered = texts.map((t, i) => `<<<LLMT-${i}>>>\n${t}\n${DELIM}`).join("\n");
   return [
-    `You are a translation API. You MUST return ONLY a JSON array of strings, nothing else.`,
+    `You are a machine translation engine. Translate ${texts.length} text blocks from ${source} to ${target}.`,
     ``,
-    `Task: translate ${texts.length} numbered snippets from ${source} to ${target}.`,
+    `INPUT FORMAT: each block is delimited like this:`,
+    `<<<LLMT-N>>>`,
+    `...block content...`,
+    `${DELIM}`,
     ``,
-    `Rules:`,
-    `- Preserve original meaning, tone, and inline formatting (HTML tags, markdown, punctuation, whitespace).`,
-    `- If a snippet is already in ${target}, copy it into the output unchanged (still as a JSON string in the array).`,
-    `- NEVER add commentary, notes, explanations, or [index] prefixes to the output.`,
-    `- NEVER wrap the output in markdown code fences or prose.`,
-    `- The response MUST start with '[' and end with ']'.`,
-    `- The array MUST have EXACTLY ${texts.length} string elements, in the same order as the input.`,
+    `OUTPUT FORMAT: respond with EXACTLY ${texts.length} blocks in the SAME format, in the SAME order:`,
+    `<<<LLMT-0>>>`,
+    `translation of block 0`,
+    `${DELIM}`,
+    `<<<LLMT-1>>>`,
+    `translation of block 1`,
+    `${DELIM}`,
+    `... and so on for all ${texts.length} blocks.`,
     ``,
-    `Input:`,
+    `RULES:`,
+    `- Preserve inline HTML, markdown, punctuation, and internal whitespace of each block.`,
+    `- If a block is already in ${target}, output it unchanged (still wrapped in the delimiter format).`,
+    `- Do NOT add commentary, headers, or explanations outside the delimiter blocks.`,
+    `- Do NOT wrap the output in markdown code fences.`,
+    ``,
+    `INPUT (${texts.length} blocks):`,
     numbered,
     ``,
-    `Now output the JSON array of ${texts.length} translations:`,
+    `Now output ${texts.length} translated blocks:`,
   ].join("\n");
 }
 
@@ -169,31 +184,33 @@ function runClaude(prompt) {
 }
 
 function parseTranslations(raw, expectedLen) {
-  const trimmed = raw.trim();
-
-  // 1) Try direct JSON parse
-  let arr = tryJson(trimmed);
-
-  // 2) Try to extract the first well-formed [...] block (Claude sometimes prepends prose)
-  if (!arr) {
-    const m = trimmed.match(/\[[\s\S]*\]/);
-    if (m) arr = tryJson(m[0]);
+  // Primary path: delimiter-based parsing. Find each "<<<LLMT-N>>> ... <<<LLMT-END>>>" block.
+  // Regex is anchored on our custom sentinel, so stray prose Claude adds is skipped.
+  const re = /<<<LLMT-(\d+)>>>\s*([\s\S]*?)\s*<<<LLMT-END>>>/g;
+  const out = new Array(expectedLen).fill(null);
+  let m;
+  let matched = 0;
+  while ((m = re.exec(raw)) !== null) {
+    const idx = Number(m[1]);
+    if (idx >= 0 && idx < expectedLen && out[idx] === null) {
+      out[idx] = m[2];
+      matched++;
+    }
   }
 
-  // 3) Fallback: parse the "[N] translation\n---\n[N+1] ..." plain-text format
-  //    (Claude occasionally echoes the input format instead of returning JSON.)
-  if (!arr) {
-    arr = parseIndexedFallback(trimmed, expectedLen);
-    if (arr) console.warn(`[translate] used indexed-fallback parser (JSON parse failed)`);
+  if (matched === 0) {
+    // Last-ditch: legacy JSON array fallback (in case someone flips MODEL back to opus
+    // and it emits the old shape).
+    const arr = tryJson(raw.trim()) || (raw.match(/\[[\s\S]*\]/) && tryJson(raw.match(/\[[\s\S]*\]/)[0]));
+    if (arr && arr.length === expectedLen) return arr.map(String);
+    throw new Error(`failed to parse translations: 0/${expectedLen} delimited blocks found.\nraw: ${raw.slice(0, 400)}`);
   }
 
-  if (!arr) {
-    throw new Error(`failed to parse translations from claude output.\nraw: ${raw.slice(0, 500)}`);
+  if (matched < expectedLen) {
+    console.warn(`[translate] partial parse: got ${matched}/${expectedLen} blocks (missing indexes filled with empty)`);
+    for (let i = 0; i < expectedLen; i++) if (out[i] === null) out[i] = "";
   }
-  if (arr.length !== expectedLen) {
-    console.warn(`[translate] length mismatch: got ${arr.length}, expected ${expectedLen}`);
-  }
-  return arr.map((x) => String(x));
+  return out.map(String);
 }
 
 function tryJson(s) {
@@ -203,23 +220,6 @@ function tryJson(s) {
   } catch {
     return null;
   }
-}
-
-// Parse the "[0] foo\n---\n[1] bar\n---\n[2] baz" style Claude sometimes emits.
-function parseIndexedFallback(raw, expectedLen) {
-  const parts = raw.split(/\n?---\n?/);
-  const out = new Array(expectedLen).fill("");
-  let matched = 0;
-  for (const part of parts) {
-    const m = part.match(/^\s*\[(\d+)\]\s*([\s\S]*?)\s*$/);
-    if (!m) continue;
-    const idx = Number(m[1]);
-    if (idx >= 0 && idx < expectedLen) {
-      out[idx] = m[2];
-      matched++;
-    }
-  }
-  return matched > 0 ? out : null;
 }
 
 // ------ start server ------
