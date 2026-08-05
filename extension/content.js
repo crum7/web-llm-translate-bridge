@@ -597,27 +597,35 @@
   // noise marker onwards. If none match, return as-is.
   function truncateOffSecNoise(md, pageTitle) {
     if (!md) return md;
-    const NOISE_MARKERS = [
-      /^\s*!\[[^\]]*\]\(data:image\/[a-z]+;base64,/im, // any inline base64 image
-      /^\s*My Learning\s*$/im,
-      /^\s*Course\s*XP\s*OSCP\+?\s*$/im,
-      /^\s*(Overview|Syllabus|Challenge Labs|Exam)\s*$/im,
+    // Line-level filter: drop known noise lines (breadcrumb, tab labels,
+    // course-XP tags, huge base64 images, duplicate title heading).
+    // We iterate line-by-line instead of "cut at first hit" because on
+    // course pages the noise sits at the TOP of the body, so a cut-forward
+    // strategy would erase the actual lesson text below.
+    const NOISE_LINE = [
+      /^\s*My Learning\s*$/i,
+      /^\s*Course\s*$/i,
+      /^\s*XP\s*$/i,
+      /^\s*OSCP\+?\s*$/i,
+      /^\s*(Overview|Syllabus|Challenge Labs|Exam)\s*$/i,
+      /^\s*!\[[^\]]*\]\(data:image\/[a-z]+;base64,/i, // inline base64 image
     ];
-    // If the page title appears again as a heading in the body, that's the
-    // start of the duplicated TOC block — cut there.
+    // Duplicate page-title heading (e.g. "# Kali Linux..." appearing again
+    // right below our own header). Drop the exact line only, not everything
+    // after it.
+    let titleLineRe = null;
     if (pageTitle) {
       const esc = pageTitle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      NOISE_MARKERS.push(new RegExp(`^\\s*#{1,3}\\s+${esc}\\s*$`, "im"));
+      titleLineRe = new RegExp(`^\\s*#{1,6}\\s+${esc}\\s*$`, "i");
     }
-    let cutAt = md.length;
-    for (const re of NOISE_MARKERS) {
-      const m = md.match(re);
-      if (m && m.index != null && m.index < cutAt) cutAt = m.index;
+    const kept = [];
+    for (const line of md.split(/\r?\n/)) {
+      if (NOISE_LINE.some((re) => re.test(line))) continue;
+      if (titleLineRe && titleLineRe.test(line)) continue;
+      kept.push(line);
     }
-    if (cutAt < md.length) {
-      return md.slice(0, cutAt).trimEnd();
-    }
-    return md;
+    // Collapse runs of blank lines that the removals may have created.
+    return kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
   }
 
   // Remove structural noise (nav, sidebar, TOC, header, footer, breadcrumbs, ...)
